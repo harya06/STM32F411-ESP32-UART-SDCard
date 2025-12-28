@@ -1,0 +1,671 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>IoT-Node Device Configuration</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <style>
+    :root {
+      --bg: #f2f4f7;
+      --card: #ffffff;
+      --border: #d0d7de;
+      --primary: #2563eb;
+      --success: #16a34a;
+      --danger: #dc2626;
+      --text: #111827;
+      --muted: #6b7280;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--text);
+    }
+
+    header {
+      background: linear-gradient(135deg, #0f172a, #1e293b);
+      color: #e5e7eb;
+      padding: 18px 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    header .title {
+      font-size: 18px;
+      font-weight: 600;
+    }
+
+    header .subtitle {
+      font-size: 12px;
+      color: #9ca3af;
+    }
+
+    .container {
+      max-width: 1100px;
+      margin: 24px auto;
+      padding: 0 16px;
+    }
+
+    .card h3 {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .card h3::before {
+      content: "▌";
+      color: var(--primary);
+      font-weight: bold;
+    }
+
+    .action-bar {
+      display: flex;
+      gap: 12px;
+      margin-top: 20px;
+    }
+
+    .action-bar button {
+      flex: 1;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 16px;
+    }
+
+    label {
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 6px;
+      display: block;
+      color: var(--muted);
+    }
+
+    input, select {
+      width: 100%;
+      padding: 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      font-size: 14px;
+      background: #fff;
+    }
+
+    input:focus, select:focus {
+      outline: none;
+      border-color: var(--primary);
+    }
+
+    input::placeholder {
+      color: #9ca3af;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+    }
+
+    table tbody tr:hover {
+      background: #f8fafc;
+    }
+
+    th, td {
+      border: 1px solid var(--border);
+      padding: 10px;
+      text-align: center;
+      font-size: 14px;
+    }
+
+    th {
+      background: #f8fafc;
+      color: var(--muted);
+    }
+
+    .btn {
+      padding: 10px 14px;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 600;
+      border: none;
+      cursor: pointer;
+    }
+
+    .btn-add {
+      background: var(--success);
+      color: #fff;
+      margin-bottom: 8px;
+    }
+
+    .btn-del {
+      background: var(--danger);
+      color: #fff;
+    }
+
+    .btn-save {
+      background: linear-gradient(135deg, #2563eb, #1d4ed8);
+      color: #fff;
+      font-size: 16px;
+      padding: 14px;
+      width: 100%;
+      margin-top: 16px;
+    }
+
+    .action-bar {
+      display: flex;
+      gap: 12px;
+      margin-top: 20px;
+    }
+
+    .action-bar button {
+      flex: 1;
+    }
+
+    .action-panel {
+      position: sticky;
+      bottom: 0;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      margin-top: 24px;
+      padding: 16px;
+      background: #f8fafc;
+      border-top: 1px solid var(--border);
+      z-index: 10;
+    }
+
+    .action-btn {
+      height: 52px;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: 600;
+      border: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+
+    .action-btn.primary {
+      background: linear-gradient(135deg, #2563eb, #1d4ed8);
+      color: #fff;
+    }
+
+    .action-btn.secondary {
+      background: #374151;
+      color: #fff;
+    }
+
+    .action-btn:hover {
+      opacity: 0.92;
+    }
+
+    .spinner {
+      width: 18px;
+      height: 18px;
+      border: 2px solid rgba(255,255,255,0.4);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    .action-btn:disabled {
+      opacity: 0.7;
+      cursor: not-allowed;
+    }
+
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.45);
+    }
+
+    .modal-box {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      background: #fff;
+      padding: 20px;
+      border-radius: 10px;
+      width: 90%;
+      max-width: 360px;
+      text-align: center;
+    }
+
+    .modal-box h3 {
+      margin-top: 0;
+    }
+
+    .modal-box button {
+      margin-top: 16px;
+    }
+
+    .action-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    #unsavedBadge {
+      font-weight: 600;
+    }
+
+    footer {
+      text-align: center;
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 30px;
+      padding-bottom: 10px;
+    }
+  </style>
+</head>
+
+<body>
+<header>
+  <div>
+    <div class="title">IoT-Node Configuration Panel</div>
+    <div class="subtitle">
+      Local Setup • Access Point Mode
+      <span id="unsavedBadge" style="display:none; margin-left:8px; color:#fbbf24;">
+        ● Unsaved changes
+      </span>
+    </div>
+  </div>
+</header>
+
+<div id="modal" style="display:none;">
+  <div class="modal-backdrop"></div>
+  <div class="modal-box">
+    <h3 id="modalTitle"></h3>
+    <p id="modalMsg"></p>
+    <button class="btn primary" onclick="closeModal()">OK</button>
+  </div>
+</div>
+
+<div class="container">
+
+  <div class="card">
+    <h3>Basic Configuration</h3>
+    <div class="grid">
+      <div>
+        <label>Box ID</label>
+        <input type="number" id="boxID">
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Network Configuration</h3>
+
+    <div class="grid">
+      <div>
+        <label>Network Mode</label>
+        <select id="networkMode" onchange="onNetworkModeChange()">
+          <option value="wifi">WiFi Only</option>
+          <option value="ethernet">Ethernet Only</option>
+          <option value="hybrid">Hybrid (WiFi + Ethernet)</option>
+        </select>
+      </div>
+
+      <div id="priorityWrapper">
+        <label>Primary Network</label>
+        <select id="networkPriority">
+          <option value="ethernet">Ethernet</option>
+          <option value="wifi">WiFi</option>
+        </select>
+      </div>
+
+      <div id="wifiSSIDWrapper">
+        <label>WiFi SSID</label>
+        <input type="text" id="wifiSSID">
+      </div>
+
+      <div id="wifiPasswordWrapper">
+        <label>WiFi Password</label>
+        <div style="display:flex; gap:6px;">
+          <input type="password" id="wifiPassword" style="flex:1;">
+          <button class="btn" type="button" onclick="togglePassword()">👁</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Transport Configuration</h3>
+
+    <div class="grid">
+      <div>
+        <label>Protocol</label>
+        <select id="commMode" onchange="enforceCommNetworkRule()">
+          <option value="mqtt">MQTT</option>
+          <option value="httppost">HTTP POST</option>
+          <option value="tcp">TCP</option>
+          <option value="ws">WebSocket</option>
+        </select>
+      </div>
+
+      <div>
+        <label>Server Host</label>
+        <input type="text" id="serverIP">
+      </div>
+
+      <div>
+        <label>Port</label>
+        <input type="number" id="monitoringPort">
+      </div>
+
+      <div>
+        <label>Path</label>
+        <input type="text" id="serverPath">
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Rules</h3>
+    <button class="btn btn-add" onclick="addRule()">+ Add Rule</button>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Trigger (Input)</th>
+          <th>Output</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody id="rulesTable"></tbody>
+    </table>
+  </div>
+
+  <hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;">
+
+  <div class="action-panel">
+    <button id="btnSave" class="action-btn primary" onclick="saveConfig()">
+      Save Configuration
+    </button>
+
+    <button class="action-btn secondary" onclick="downloadConfig()">
+      Download Config
+    </button>
+  </div>
+
+  <footer>
+    IoT-Node Config UI • Local Web Interface
+  </footer>
+
+</div>
+
+<script>
+let rules = [];
+const ADMIN_PASSWORD = "password";
+let originalConfig = null;
+let isDirty = false;
+
+function addRule(trigger = "I1", output = "Q1") {
+  rules.push({ trigger, output });
+  renderRules();
+  updateDirtyState();
+}
+
+function deleteRule(index) {
+  rules.splice(index, 1);
+  renderRules();
+  updateDirtyState();
+}
+
+function renderRules() {
+  const tbody = document.getElementById("rulesTable");
+  tbody.innerHTML = "";
+
+  rules.forEach((r, i) => {
+    const tr = document.createElement("tr");
+
+    let inSel = "<select onchange='rules["+i+"].trigger=this.value'>";
+    for (let j=1;j<=15;j++) inSel += `<option ${r.trigger==="I"+j?"selected":""}>I${j}</option>`;
+    inSel += "</select>";
+
+    let outSel = "<select onchange='rules["+i+"].output=this.value'>";
+    for (let j=1;j<=4;j++) outSel += `<option ${r.output==="Q"+j?"selected":""}>Q${j}</option>`;
+    outSel += "</select>";
+
+    tr.innerHTML = `
+      <td>${inSel}</td>
+      <td>${outSel}</td>
+      <td><button class="btn btn-del" onclick="deleteRule(${i})">Delete</button></td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+function loadConfig() {
+  fetch("/config")
+    .then(r => r.json())
+    .then(cfg => {
+      document.getElementById("boxID").value =
+        cfg.device?.boxID ?? "";
+
+      document.getElementById("networkMode").value =
+        cfg.network?.mode ?? "wifi";
+
+      document.getElementById("networkPriority").value =
+        cfg.network?.priority ?? "ethernet";
+
+      onNetworkModeChange();
+
+      document.getElementById("commMode").value =
+        cfg.transport?.type ?? "mqtt";
+      
+      enforceCommNetworkRule();
+
+      document.getElementById("serverIP").value =
+        cfg.transport?.host ?? "";
+
+      document.getElementById("serverPath").value =
+        cfg.transport?.path ?? "";
+
+      document.getElementById("monitoringPort").value =
+        cfg.transport?.port ?? "";
+
+      document.getElementById("wifiSSID").value =
+        cfg.wifi?.ssid ?? "";
+
+      document.getElementById("wifiPassword").value =
+  cfg.wifi?.password ?? "";
+
+      rules = [];
+      if (cfg.rules) {
+        cfg.rules.forEach(r => {
+          const [i,o] = r.split("-");
+          rules.push({ trigger: i, output: o });
+        });
+      }
+      renderRules();
+      originalConfig = getCurrentConfig();
+      isDirty = false;
+      updateUIState();
+      attachChangeListeners();
+    });
+}
+
+function saveConfig() {
+  if (!requirePassword()) return;
+
+  const btn = document.getElementById("btnSave");
+  btn.disabled = true;
+  btn.innerHTML = `<div class="spinner"></div> Saving...`;
+
+  const cfg = getCurrentConfig();
+
+  fetch("/save", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: "config=" + encodeURIComponent(JSON.stringify(cfg, null, 2))
+  })
+  .then(r => {
+    if (!r.ok) throw new Error();
+    return r.text();
+  })
+  .then(() => {
+    originalConfig = getCurrentConfig();
+    isDirty = false;
+    updateUIState();
+    showModal(
+      "Configuration Applied",
+      "Device is restarting to apply new settings. This page will disconnect."
+    );
+  })
+  .catch(() => showModal("Save Failed", "Unable to save configuration."))
+  .finally(() => {
+    btn.disabled = false;
+    btn.innerHTML = "Save Configuration";
+  });
+}
+
+function togglePassword() {
+  const pwd = document.getElementById("wifiPassword");
+  pwd.type = (pwd.type === "password") ? "text" : "password";
+}
+
+function downloadConfig() {
+  if (!requirePassword()) return;
+  window.location.href = "/download";
+}
+
+function requirePassword() {
+  const input = prompt("Enter admin password:");
+  if (input === null) return false;
+
+  if (input !== ADMIN_PASSWORD) {
+    showModal("Access Denied", "Invalid admin password.");
+    return false;
+  }
+  return true;
+}
+
+function showModal(title, msg) {
+  document.getElementById("modalTitle").innerText = title;
+  document.getElementById("modalMsg").innerText = msg;
+  document.getElementById("modal").style.display = "block";
+}
+
+function closeModal() {
+  document.getElementById("modal").style.display = "none";
+}
+
+function getCurrentConfig() {
+  return {
+    device: {
+      boxID: Number(document.getElementById("boxID").value)
+    },
+
+    network: {
+      mode: document.getElementById("networkMode").value,
+      priority: document.getElementById("networkPriority").value
+    },
+
+    transport: {
+      type: document.getElementById("commMode").value,
+      host: document.getElementById("serverIP").value,
+      port: Number(document.getElementById("monitoringPort").value),
+      path: document.getElementById("serverPath").value
+    },
+
+    wifi: {
+      ssid: document.getElementById("wifiSSID").value,
+      password: document.getElementById("wifiPassword").value
+    },
+
+    rules: rules.map(r => `${r.trigger}-${r.output}`)
+  };
+}
+
+function updateDirtyState() {
+  const current = JSON.stringify(getCurrentConfig());
+  const original = JSON.stringify(originalConfig);
+
+  const dirtyNow = current !== original;
+
+  if (dirtyNow !== isDirty) {
+    isDirty = dirtyNow;
+    updateUIState();
+  }
+}
+
+function updateUIState() {
+  const badge = document.getElementById("unsavedBadge");
+  const btnSave = document.getElementById("btnSave");
+
+  if (isDirty) {
+    badge.style.display = "inline";
+    btnSave.disabled = false;
+  } else {
+    badge.style.display = "none";
+    btnSave.disabled = true;
+  }
+}
+
+function attachChangeListeners() {
+  document.querySelectorAll("input, select").forEach(el => {
+    el.addEventListener("input", updateDirtyState);
+    el.addEventListener("change", updateDirtyState);
+  });
+}
+
+function onNetworkModeChange() {
+  const mode = document.getElementById("networkMode").value;
+
+  document.getElementById("priorityWrapper").style.display =
+    (mode === "hybrid") ? "block" : "none";
+
+  const wifiVisible = (mode === "wifi" || mode === "hybrid");
+
+  document.getElementById("wifiSSIDWrapper").style.display =
+    wifiVisible ? "block" : "none";
+
+  document.getElementById("wifiPasswordWrapper").style.display =
+    wifiVisible ? "block" : "none";
+}
+
+function enforceCommNetworkRule() {
+  const commMode = document.getElementById("commMode").value;
+  const networkMode = document.getElementById("networkMode");
+
+  const wifiOpt = networkMode.querySelector('option[value="wifi"]');
+  const ethOpt  = networkMode.querySelector('option[value="ethernet"]');
+  const hybOpt  = networkMode.querySelector('option[value="hybrid"]');
+
+  if (commMode === "ws") {
+    // Paksa WiFi Only
+    networkMode.value = "wifi";
+
+    // Disable opsi lain
+    ethOpt.disabled = true;
+    hybOpt.disabled = true;
+
+    // Update tampilan
+    onNetworkModeChange();
+  } else {
+    // Bebaskan kembali
+    ethOpt.disabled = false;
+    hybOpt.disabled = false;
+  }
+
+  updateDirtyState();
+}
+
+loadConfig();
+</script>
+</body>
+</html>
