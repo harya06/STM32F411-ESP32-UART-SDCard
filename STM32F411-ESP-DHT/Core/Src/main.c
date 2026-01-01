@@ -33,51 +33,42 @@
 /* USER CODE BEGIN PTD */
 
 /* USER CODE BEGIN First_Private_Defines */
-#define NUM_ANALOG 4U
+#define NUM_ANALOG  4U
+#define NUM_INPUTS  11U
+#define NUM_OUTPUTS 4U
 /* USER CODE END First_Private_Defines */
 
+
+/* DS3231 RTC Time Structure */
 typedef struct
 {
     uint8_t  seconds;
     uint8_t  minutes;
     uint8_t  hours;
-    uint8_t  dayOfWeek;   // 1=Sunday .. 7=Saturday
-    uint8_t  day;         // 1..31
-    uint8_t  month;       // 1..12
-    uint16_t year;        // mis: 2025
+    uint8_t  dayOfWeek;
+    uint8_t  day;
+    uint8_t  month;
+    uint16_t year;
 } DS3231_TimeTypeDef;
 
-/*Struct Input/Output fisik*/
+/* GPIO Pin Definition */
 typedef struct {
     GPIO_TypeDef *Port;
     uint16_t      Pin;
 } IO_PinDef_t;
 
-/*Enum index input/output logis*/
+/* Input Index Enum */
 typedef enum {
-    IN_1 = 0,
-    IN_2,
-    IN_3,
-    IN_4,
-    IN_5,
-    IN_6,
-    IN_7,
-    IN_8,
-    IN_9,
-    IN_10,
-    IN_11,
-    NUM_INPUTS
+    IN_1 = 0, IN_2, IN_3, IN_4, IN_5,
+    IN_6, IN_7, IN_8, IN_9, IN_10, IN_11
 } InputId_t;
 
+/* Output Index Enum */
 typedef enum {
-    OUT_1 = 0,
-    OUT_2,
-    OUT_3,
-    OUT_4,
-    NUM_OUTPUTS
+    OUT_1 = 0, OUT_2, OUT_3, OUT_4
 } OutputId_t;
 
-/*Struct Rules*/
+/* Rule Logic Enum */
 typedef enum {
     RULE_LOGIC_OFF = 0,
     RULE_LOGIC_OR,
@@ -85,21 +76,34 @@ typedef enum {
     RULE_LOGIC_NOT
 } RuleLogic_t;
 
+/* Rule Definition */
 typedef struct {
-    RuleLogic_t logic;               // OFF / OR / AND / NOT
-    uint8_t     inputs[NUM_INPUTS];  // daftar input 1..11
+    RuleLogic_t logic;
+    uint8_t     inputs[NUM_INPUTS];
     uint8_t     inputCount;
 } RuleDef_t;
 
+/* Measurement Structure */
 typedef struct {
-    uint32_t seq;                 // seq of record currently being sent
-    uint8_t  cbor_buf[256];       // CBOR payload of this record
-    uint16_t cbor_len;
-    uint8_t  retry_count;
-    uint32_t ack_deadline_ms;
-    uint8_t  waiting_ack;         // flag used alongside state
+    uint32_t           seq;
+    DS3231_TimeTypeDef rtc;
+    int16_t            temp;        		// °C × 10
+    int16_t            hum;        			// % × 10
+    uint16_t           dig_in;      		// bitmask
+    uint16_t           an_in[NUM_ANALOG];   // 0-255
+    uint8_t            q;           		// output bitmask
+} Measurement_t;
+
+/* TX Context */
+typedef struct {
+    uint32_t seq;
+    char     jsonLine[320];
+    uint16_t jsonLen;
+    uint8_t  retryCount;
+    uint32_t ackDeadlineMs;
 } TxContext_t;
 
+/* Application State */
 typedef enum {
     APP_STATE_INIT = 0,
     APP_STATE_SD_MOUNT,
@@ -107,9 +111,9 @@ typedef enum {
     APP_STATE_RUN
 } AppState_t;
 
+/* TX State */
 typedef enum {
     TX_STATE_IDLE = 0,
-    TX_STATE_LOAD_HEAD,
     TX_STATE_SEND_FRAME,
     TX_STATE_WAIT_TX_COMPLETE,
     TX_STATE_WAIT_ACK,
@@ -118,51 +122,83 @@ typedef enum {
     TX_STATE_MOVE_TO_ERROR
 } TxState_t;
 
-typedef enum {
-    RX_STATE_WAIT_SOF = 0,
-    RX_STATE_TYPE,
-    RX_STATE_CMD,
-    RX_STATE_LEN_H,
-    RX_STATE_LEN_L,
-    RX_STATE_PAYLOAD,
-    RX_STATE_CRC_H,
-    RX_STATE_CRC_L
-} RxState_t;
-
-// Satu sampel measurement
-typedef struct {
-    uint32_t seq;
-    DS3231_TimeTypeDef rtc;
-    float temp;
-    float hum;
-    uint8_t dig_in[NUM_INPUTS];
-    uint8_t an_in[NUM_ANALOG];
-    uint8_t q[NUM_OUTPUTS];
-} Measurement_t;
-
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define SOF_BYTE                0x7E
-#define DS3231_ADDR             (0x68U << 1)
-#define ADS1115_ADDR            (0x48U << 1)
+/* ==================== TLV FORMAT (UART only) ==================== */
+#define TLV_SOF             0x7E
 
-#define ADS_FS_VOLT             4.096f
-#define ADS_READ_PERIOD_MS      100U
+#define TLV_TAG_SEQ         0x01    // uint32 BE
+#define TLV_TAG_TEMP        0x02    // int16 BE (°C × 10)
+#define TLV_TAG_HUM         0x03    // int16 BE (% × 10)
+#define TLV_TAG_DIG_IN      0x04    // uint16 BE (bitmask)
+#define TLV_TAG_AN_IN       0x05    // uint16[4] BE
+#define TLV_TAG_Q           0x06    // uint8 (bitmask)
+#define TLV_TAG_TIMESTAMP   0x07    // uint32 BE
 
+/* Frame types for UART communication */
+#define FRAME_TYPE_DATA     0x01
+#define FRAME_TYPE_ACK      0x02
+#define FRAME_TYPE_RULES    0x03
+#define FRAME_TYPE_RTC      0x04
+#define FRAME_TYPE_ERROR    0x05
+
+/* TLV tags from ESP32 */
+#define TAG_RULE            0x10
+#define TAG_RTC_TS          0x20
+
+/* TLV tags for error report STM32 -> ESP */
+#define TLV_TAG_ERR_MODULE  0x30   // u8
+#define TLV_TAG_ERR_CODE    0x31   // u8
+#define TLV_TAG_ERR_ACTIVE  0x32   // u8 (1 = error, 0 = clear)
+
+/* I2C Addresses */
+#define DS3231_ADDR         (0x68U << 1)
+#define ADS1115_ADDR        (0x48U << 1)
+
+/* ADS1115 */
+#define ADS_FS_VOLT         4.096f
+#define ADS_READ_PERIOD_MS  100U
+
+/* Error module IDs */
+#define ERR_MOD_RTC   1
+#define ERR_MOD_DHT   2
+#define ERR_MOD_ADS   3
+#define ERR_MOD_SD    4
+
+/* Generic error codes */
+#define ERR_CODE_OK          0
+#define ERR_CODE_READ_FAIL   1
+#define ERR_CODE_I2C_TX_FAIL 2
+#define ERR_CODE_I2C_RX_FAIL 3
+#define ERR_CODE_MOUNT_FAIL  4
+#define ERR_CODE_OPEN_FAIL   5
+#define ERR_CODE_WRITE_FAIL  6
+
+/* Buffers */
 #define RX_BUF_SIZE             256U
+#define UART_FRAME_MAX_LEN      300U
+#define JSON_LINE_MAX           320U
+
+/* Timing */
 #define INPUT_CHANGE_TIME_MS    500U
 #define DELIVERY_TIME_INTERVAL  60000U
+#define TX_MAX_RETRY            3U
+#define ACK_TIMEOUT_MS          2000U
+
+/* Startup delay before first log/send */
+#define STARTUP_DELAY_MS        10000U
+
+/* DHT error reporting delay */
+#define DHT_ERROR_ENABLE_DELAY_MS   5000U   // 5 detik setelah boot
+
+/* Rules */
 #define RULE_MAX_PAYLOAD        240U
 #define RULE_STR_MAX_LEN        32U
 
-#define LOG_FILE_NAME      "log.cbor"
-#define ERROR_FILE_NAME    "error.cbor"
-
-#define TX_MAX_RETRY       3
-#define ACK_TIMEOUT_MS     2000U
-#define UART_FRAME_MAX_LEN 300
+/* File names*/
+#define LOG_FILE_NAME           "log.json"
 
 /* USER CODE END PD */
 
@@ -182,52 +218,53 @@ UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 
+/* Sensor data */
+static float     g_temp = 0.0f;
+static float     g_hum  = 0.0f;
+static char      g_debugBuf[384];
+static uint32_t  g_bootMs = 0;
 
-static float     temp = 0.0f;
-static float     hum  = 0.0f;
-static char      buf[256];
-
+/* Input state */
 static volatile uint16_t g_inputMaskStable = 0;
 static volatile uint8_t  g_ruleUpdated     = 0;
 
-static int16_t  g_anRaw[NUM_ANALOG];    // RAW ADS1115
-static uint8_t  g_anCache[NUM_ANALOG];  // 0..255 scaled
+/* ADS1115 */
+static int16_t  g_anRaw[NUM_ANALOG];
+static uint8_t  g_anCache[NUM_ANALOG];
 static uint32_t g_adsTick = 0;
 
-static uint8_t  rxByte;
-static uint8_t           ruleFrameBuf[RX_BUF_SIZE];
-static uint16_t          ruleFrameIdx    = 0;
-static int16_t           ruleExpectedLen = -1;
-static char              ruleJsonRaw[RX_BUF_SIZE];
+/* UART RX - ESP32 */
+static uint8_t  g_rxByte;
+static uint8_t  g_frameBuf[RX_BUF_SIZE];
+static uint16_t g_frameIdx      = 0;
+static int16_t  g_expectedLen   = -1;
 
-static uint8_t rs485RxByte;
-static uint8_t          rs485Buf[128];
-static uint16_t         rs485Idx = 0;
+/* UART RX - RS485/Debug */
+static uint8_t  g_rs485RxByte;
+static uint8_t  g_rs485Buf[128];
+static uint16_t g_rs485Idx = 0;
 
+/* Application state */
 static AppState_t g_appState = APP_STATE_SD_MOUNT;
-static TxState_t  g_txState  = TX_STATE_IDLE;
 
+/* SD Card */
 static uint8_t  g_sd_mounted = 0;
 static uint32_t g_nextSeq    = 1;
 
-// Flag dari ISR
-volatile uint8_t g_acq_timer_flag = 0;
+/* Flags */
 volatile uint8_t g_io_changed_flag = 0;
 
-// ACK dari ESP32
+/* ACK from ESP32 */
 volatile uint8_t  g_ack_pending = 0;
 volatile uint32_t g_ack_seq     = 0;
 
-// UART2 TX (non-blocking)
-static uint8_t  g_uart2_tx_done = 1;
-static uint8_t  g_uart2_tx_buf[UART_FRAME_MAX_LEN];
-static uint16_t g_uart2_tx_len  = 0;
-static TxContext_t g_tx;
+/* Error flags */
+static uint8_t g_err_rtc = 0;
+static uint8_t g_err_dht = 0;
+static uint8_t g_err_ads = 0;
+static uint8_t g_err_sd  = 0;
 
-// State penerima ACK
-static RxState_t g_rxState;
-
-/* Mapping input I1..I11 */
+/* Input mapping */
 static const IO_PinDef_t g_inputs[NUM_INPUTS] =
 {
     [IN_1]  = { INPUT_1_GPIO_Port,  INPUT_1_Pin  },
@@ -243,7 +280,7 @@ static const IO_PinDef_t g_inputs[NUM_INPUTS] =
     [IN_11] = { INPUT_11_GPIO_Port, INPUT_11_Pin }
 };
 
-/* Mapping output Q1..Q4 */
+/* Output mapping */
 static const IO_PinDef_t g_outputs[NUM_OUTPUTS] = {
     [OUT_1] = { OUTPUT_1_GPIO_Port, OUTPUT_1_Pin },
     [OUT_2] = { OUTPUT_2_GPIO_Port, OUTPUT_2_Pin },
@@ -251,9 +288,8 @@ static const IO_PinDef_t g_outputs[NUM_OUTPUTS] = {
     [OUT_4] = { OUTPUT_4_GPIO_Port, OUTPUT_4_Pin }
 };
 
-/* Rules aktif untuk Q1..Q4 */
+/* Rules */
 static RuleDef_t g_rules[NUM_OUTPUTS];
-
 
 /* USER CODE END PV */
 
@@ -267,7 +303,10 @@ static void MX_I2C2_Init(void);
 static void MX_SPI1_Init(void);
 /* USER CODE BEGIN PFP */
 
-/*Fungsi Sensor Suhu*/
+/* Utility */
+static void UART_Print(const char* str);
+
+/* DHT22 */
 void DWT_Delay_Init(void);
 void delay_us(uint32_t us);
 void DHT_SetOutput(void);
@@ -277,60 +316,84 @@ uint8_t DHT_ReadBit(void);
 uint8_t DHT_ReadByte(void);
 uint8_t DHT22_Read(float *temperature, float *humidity);
 
-/*Fungsi RTC*/
+/* DS3231 RTC */
 static uint8_t bcd2bin(uint8_t val);
 static uint8_t bin2bcd(uint8_t val);
 uint8_t DS3231_ReadTime(DS3231_TimeTypeDef *t);
 uint8_t DS3231_SetTime(const DS3231_TimeTypeDef *t);
+static uint8_t IsLeapYear(uint16_t year);
 static uint32_t RTC_ToEpochSeconds(const DS3231_TimeTypeDef *t);
+static void EpochToRTC(uint32_t epoch, DS3231_TimeTypeDef *t);
 
-/* Fungsi ADS1115 */
-static int16_t ADS1115_ReadRaw(uint8_t ch);    // channel 0..3
+/* ADS1115 */
+static int16_t ADS1115_ReadRaw(uint8_t ch);
 static float ADS1115_ConvertRawToVolt(int16_t raw);
 static void ADS_Task(void);
-uint8_t VoltageToPWM_0_255(float voltage);
+static uint8_t VoltageToPWM_0_255(float voltage);
 
+/* CRC */
+static uint16_t CRC16_Modbus(const uint8_t *data, uint16_t len);
 
-/*Callback ESP*/
+/* TLV Encoder (for UART TX to ESP32) */
+static size_t TLV_PutU8(uint8_t *buf, uint8_t tag, uint8_t val);
+static size_t TLV_PutU16(uint8_t *buf, uint8_t tag, uint16_t val);
+static size_t TLV_PutI16(uint8_t *buf, uint8_t tag, int16_t val);
+static size_t TLV_PutU32(uint8_t *buf, uint8_t tag, uint32_t val);
+static size_t TLV_PutU16Array4(uint8_t *buf, uint8_t tag, const uint16_t arr[4]);
+static size_t TLV_EncodeMeasurement(const Measurement_t *m, uint8_t *out, size_t maxLen);
+static void SendErrorTLV(uint8_t moduleId, uint8_t code, uint8_t active);
+
+/* TLV Parser (from ESP32) */
+static uint16_t TLV_ReadU16BE(const uint8_t *p);
+static uint32_t TLV_ReadU32BE(const uint8_t *p);
+
+/* JSON Encoder/Parser (for SD Card log & debug) */
+static size_t JSON_EncodeMeasurement(const Measurement_t *m, char *out, size_t maxLen);
+static bool JSON_ParseSeqFromLine(const char *line, uint32_t *outSeq);
+static bool JSON_ParseToMeasurement(const char *json, Measurement_t *m);
+
+/* Rules & Frame RX */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart);
 static void Rules_Reset(void);
 static void ParseOneRuleString(const char *ruleStr);
-void ParseRuleJSON(char *json);
+static void ParseRulesTLV(const uint8_t *tlv, size_t len);
+static void ParseRTCTLV(const uint8_t *tlv, size_t len);
+static void ParseACKTLV(const uint8_t *tlv, size_t len);
 static uint8_t EvalOutputState(int qIdx, uint16_t inputMask);
-void ApplyRules(uint16_t inputMask);
-void PrintRuleStatus(void);
-void ParseRTCJSON(const char *json);
-void OnRuleFrameReceived(uint8_t *payload, uint16_t len);
+static void ApplyRules(uint16_t inputMask);
+static void PrintRuleStatus(void);
+static void OnFrameReceived(uint8_t *payload, uint16_t len, uint8_t frameType);
 
-void Log_InitRuntime(void);
-bool SD_MountTask(void);
-bool Log_RecoverTask(void);
+/* Logging / ACK helper */
+static bool Log_RemoveSeq(uint32_t seqToRemove);
+static bool SendMeasurementTLV(const Measurement_t *m);
+static void App_HandleAck(void);
 
-void App_BackgroundSensors(uint32_t now);
-void App_HandleAcquisition(uint32_t now);
+/* SD Card & Log (JSON format) */
+static void Log_InitRuntime(void);
+static bool SD_MountTask(void);
+static bool Log_RecoverTask(void);
+static bool Log_AppendJSON(const char *jsonLine);
 
-void Tx_InitRuntime(TxContext_t *ctx);
-void Tx_StateMachine_Run(TxState_t *state, TxContext_t *ctx, uint32_t now);
+/* Application */
+static void App_BackgroundSensors(uint32_t now);
+static void App_HandleAcquisition(uint32_t now);
+static void Acquire_FillMeasurement(Measurement_t *m, const DS3231_TimeTypeDef *rtc);
 
-uint16_t CRC16_Modbus(uint8_t *data, uint16_t len);
-size_t CBOR_EncodeMeasurement(const Measurement_t *m, uint8_t *out, size_t max_len);
-
-bool Log_AppendRecord(const uint8_t *cbor, size_t len);
-bool Log_AppendErrorRecord(const uint8_t *cbor, size_t len);
-bool Log_ReadHeadRecord(uint32_t *out_seq, uint8_t *out_cbor, uint16_t *out_len);
-bool Log_TruncateUpToSeq(uint32_t upto_seq);
-bool Log_ReadNextRecordFromFile(FIL *pf, uint32_t *out_seq, uint8_t *out_cbor, uint16_t *out_len);
-
-/*Debug log*/
-static void Debug_PrintMeasurementJSON(const Measurement_t *m, bool trigByIo);
+/* Debug */
+static void Debug_ErrorJson(const char* module, const char* code, const char* msg, uint8_t active);
+static void Debug_PrintMeasurementJSON(const Measurement_t *m, bool byIo);
+static void Debug_DumpTLV(const char *prefix, const uint8_t *tlv, size_t len);
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-static void UART_Print(char* str)
+
+/* ==================== UTILITY ==================== */
+static void UART_Print(const char* str)
 {
-    HAL_UART_Transmit(&huart1, (uint8_t *) str, strlen(str), 100);
+    HAL_UART_Transmit(&huart1, (uint8_t *)str, strlen(str), 100);
 }
 
 /* USER CODE END 0 */
@@ -359,7 +422,9 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
+
   DWT_Delay_Init();
+  g_bootMs = HAL_GetTick();   // simpan waktu boot untuk referensi DHT
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -372,11 +437,16 @@ int main(void)
   MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
 
-  Log_InitRuntime();
-  Tx_InitRuntime(&g_tx);
+  UART_Print("\r\n");
+  UART_Print("============================================\r\n");
+  UART_Print("  STM32 IoT Node - TLV/JSON Hybrid v1.0\r\n");
+  UART_Print("  UART Comms : TLV Binary\r\n");
+  UART_Print("  SD Card    : JSON (Human-readable)\r\n");
+  UART_Print("  Debug      : JSON (Human-readable)\r\n");
+  UART_Print("============================================\r\n");
 
+  Log_InitRuntime();
   g_appState = APP_STATE_SD_MOUNT;
-  g_txState  = TX_STATE_IDLE;
 
   /* USER CODE END 2 */
 
@@ -391,25 +461,30 @@ int main(void)
 	  case APP_STATE_SD_MOUNT:
 		  if (SD_MountTask()) {
 			  g_appState = APP_STATE_LOG_RECOVER;
+	      } else {
+	          HAL_Delay(1000); // Retry delay
 	      }
 	      break;
 
 	  case APP_STATE_LOG_RECOVER:
-	      if (Log_RecoverTask()) {
-	          g_appState = APP_STATE_RUN;
-	      }
-	      break;
+		  if (Log_RecoverTask()) {
+	    	  g_appState = APP_STATE_RUN;
+	          UART_Print("[APP] Entering RUN state\r\n");
+		  }
+		  break;
 
 	  case APP_STATE_RUN:
-	      App_BackgroundSensors(now);             // update cache DHT, ADS, input, rules
-	      App_HandleAcquisition(now);             // buat measurement & append ke log.cbor jika trigger
-	      Tx_StateMachine_Run(&g_txState, &g_tx, now); // kirim record tertua, handle ACK/retry
+	      App_BackgroundSensors(now);
+	      App_HandleAcquisition(now);
+	      App_HandleAck();
 	      break;
 
 	  default:
 	      g_appState = APP_STATE_SD_MOUNT;
 	      break;
 	  }
+
+	  HAL_Delay(1);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -597,7 +672,7 @@ static void MX_USART1_UART_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USART1_Init 2 */
-  HAL_UART_Receive_IT(&huart1, &rs485RxByte, 1);
+  HAL_UART_Receive_IT(&huart1, &g_rs485RxByte, 1);
 
   /* USER CODE END USART1_Init 2 */
 
@@ -631,7 +706,7 @@ static void MX_USART2_UART_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USART2_Init 2 */
-  	HAL_UART_Receive_IT(&huart2, &rxByte, 1);
+  	HAL_UART_Receive_IT(&huart2, &g_rxByte, 1);
 
   	HAL_NVIC_SetPriority(USART2_IRQn, 5, 0);
   	HAL_NVIC_EnableIRQ(USART2_IRQn);
@@ -705,7 +780,8 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-/* ===================== DWT DELAY ===================== */
+
+/* ==================== DWT DELAY ==================== */
 void DWT_Delay_Init(void)
 {
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
@@ -720,13 +796,12 @@ void delay_us(uint32_t us)
     while ((DWT->CYCCNT - start) < cycles);
 }
 
-
-/* ===================== GPIO MODE ===================== */
+/* ==================== DHT22 DRIVER ==================== */
 void DHT_SetOutput(void)
 {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
     GPIO_InitStruct.Pin = SUHU_SENSOR_Pin;
-    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;   // PUSH-PULL
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(SUHU_SENSOR_GPIO_Port, &GPIO_InitStruct);
@@ -737,72 +812,53 @@ void DHT_SetInput(void)
     GPIO_InitTypeDef GPIO_InitStruct = {0};
     GPIO_InitStruct.Pin = SUHU_SENSOR_Pin;
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull = GPIO_PULLUP;           // pakai pull-up + resistor 10k eksternal
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
     HAL_GPIO_Init(SUHU_SENSOR_GPIO_Port, &GPIO_InitStruct);
 }
-
-/* ===================== DHT22  DRIVER ===================== */
 
 uint8_t DHT_Start(void)
 {
     uint32_t timeout;
 
-    // Host pull low minimal 1ms
     DHT_SetOutput();
     HAL_GPIO_WritePin(SUHU_SENSOR_GPIO_Port, SUHU_SENSOR_Pin, GPIO_PIN_RESET);
-    HAL_Delay(2);                         // 2ms
+    HAL_Delay(2);
     HAL_GPIO_WritePin(SUHU_SENSOR_GPIO_Port, SUHU_SENSOR_Pin, GPIO_PIN_SET);
-    delay_us(30);                         // 20-40us
+    delay_us(30);
     DHT_SetInput();
 
-    // Sensor response: 80us LOW
     timeout = 0;
     while (HAL_GPIO_ReadPin(SUHU_SENSOR_GPIO_Port, SUHU_SENSOR_Pin) == GPIO_PIN_SET)
     {
         delay_us(1);
-        if (++timeout > 200)              // ~200us timeout
-            return 0;                     // tidak respon
+        if (++timeout > 200) return 0;
     }
 
-    // 80us HIGH
     timeout = 0;
     while (HAL_GPIO_ReadPin(SUHU_SENSOR_GPIO_Port, SUHU_SENSOR_Pin) == GPIO_PIN_RESET)
     {
         delay_us(1);
-        if (++timeout > 200)
-            return 0;                     // timing salah
+        if (++timeout > 200) return 0;
     }
 
-    // Tunggu LOW pertama data (awal bit pertama)
     timeout = 0;
     while (HAL_GPIO_ReadPin(SUHU_SENSOR_GPIO_Port, SUHU_SENSOR_Pin) == GPIO_PIN_SET)
     {
         delay_us(1);
-        if (++timeout > 200)
-            return 0;
+        if (++timeout > 200) return 0;
     }
 
-    // Sekarang jalur dalam keadaan LOW (awal bit pertama)
     return 1;
 }
 
 uint8_t DHT_ReadBit(void)
 {
     uint8_t bit = 0;
-
-    // Saat fungsi dipanggil, jalur sedang LOW (50us).
-    // Tunggu naik (awal HIGH bit).
     while (HAL_GPIO_ReadPin(SUHU_SENSOR_GPIO_Port, SUHU_SENSOR_Pin) == GPIO_PIN_RESET);
-
-    // Setelah naik, tunggu ~40us lalu sampling
     delay_us(40);
-
     if (HAL_GPIO_ReadPin(SUHU_SENSOR_GPIO_Port, SUHU_SENSOR_Pin) == GPIO_PIN_SET)
         bit = 1;
-
-    // Tunggu sampai jalur LOW lagi (akhir HIGH)
     while (HAL_GPIO_ReadPin(SUHU_SENSOR_GPIO_Port, SUHU_SENSOR_Pin) == GPIO_PIN_SET);
-
     return bit;
 }
 
@@ -821,28 +877,23 @@ uint8_t DHT22_Read(float *temperature, float *humidity)
 {
     uint8_t data[5];
 
-    if (!DHT_Start())
-        return 0;
+    if (!DHT_Start()) return 0;
 
-    // Baca 5 byte (40 bit)
     data[0] = DHT_ReadByte();
     data[1] = DHT_ReadByte();
     data[2] = DHT_ReadByte();
     data[3] = DHT_ReadByte();
     data[4] = DHT_ReadByte();
 
-    // Checksum
     uint8_t sum = data[0] + data[1] + data[2] + data[3];
-    if (sum != data[4])
-        return 0;
+    if (sum != data[4]) return 0;
 
-    // Konversi (format DHT22)
     uint16_t rawHum  = (data[0] << 8) | data[1];
     int16_t  rawTemp = (data[2] << 8) | data[3];
 
     *humidity = rawHum / 10.0f;
 
-    if (rawTemp & 0x8000)           // bit sign
+    if (rawTemp & 0x8000)
     {
         rawTemp &= 0x7FFF;
         *temperature = -rawTemp / 10.0f;
@@ -852,15 +903,13 @@ uint8_t DHT22_Read(float *temperature, float *humidity)
         *temperature = rawTemp / 10.0f;
     }
 
-    // Filter nilai tidak masuk akal
     if (*humidity < 0.0f || *humidity > 100.0f) return 0;
     if (*temperature < -40.0f || *temperature > 80.0f) return 0;
 
     return 1;
 }
 
-
-/*=================================== Fungsi RTC ==================================*/
+/* ==================== DS3231 RTC ==================== */
 static uint8_t bcd2bin(uint8_t val)
 {
     return (uint8_t)((val >> 4) * 10 + (val & 0x0F));
@@ -871,59 +920,41 @@ static uint8_t bin2bcd(uint8_t val)
     return (uint8_t)(((val / 10) << 4) | (val % 10));
 }
 
-/* Baca waktu dari DS3231 */
 uint8_t DS3231_ReadTime(DS3231_TimeTypeDef *t)
 {
     uint8_t buf[7];
 
-    if (HAL_I2C_Mem_Read(&hi2c1,
-                         DS3231_ADDR,
-                         0x00,                        // register detik
-                         I2C_MEMADD_SIZE_8BIT,
-                         buf,
-                         7,
-                         HAL_MAX_DELAY) != HAL_OK)
+    if (HAL_I2C_Mem_Read(&hi2c1, DS3231_ADDR, 0x00, I2C_MEMADD_SIZE_8BIT,
+                         buf, 7, 100) != HAL_OK)
     {
-        return 0;   // gagal I2C
+        return 0;
     }
 
     t->seconds   = bcd2bin(buf[0] & 0x7F);
     t->minutes   = bcd2bin(buf[1] & 0x7F);
-
-    // jam: bit 6 = 12/24h, asumsikan 24h mode
     t->hours     = bcd2bin(buf[2] & 0x3F);
-
     t->dayOfWeek = bcd2bin(buf[3] & 0x07);
     t->day       = bcd2bin(buf[4] & 0x3F);
-
-    // month: bit7 = century
     t->month     = bcd2bin(buf[5] & 0x1F);
+    t->year      = 2000 + bcd2bin(buf[6]);
 
-    t->year      = 2000 + bcd2bin(buf[6]);   // DS3231 menyimpan 00..99 -> 2000..2099
-
-    return 1;   // sukses
+    return 1;
 }
 
-/* Set waktu ke DS3231 (panggil sekali untuk set awal) */
 uint8_t DS3231_SetTime(const DS3231_TimeTypeDef *t)
 {
     uint8_t buf[7];
 
     buf[0] = bin2bcd(t->seconds);
     buf[1] = bin2bcd(t->minutes);
-    buf[2] = bin2bcd(t->hours);          // 24h mode
+    buf[2] = bin2bcd(t->hours);
     buf[3] = bin2bcd(t->dayOfWeek);
     buf[4] = bin2bcd(t->day);
-    buf[5] = bin2bcd(t->month);          // century bit 0
+    buf[5] = bin2bcd(t->month);
     buf[6] = bin2bcd((uint8_t)(t->year - 2000));
 
-    if (HAL_I2C_Mem_Write(&hi2c1,
-                          DS3231_ADDR,
-                          0x00,
-                          I2C_MEMADD_SIZE_8BIT,
-                          buf,
-                          7,
-                          HAL_MAX_DELAY) != HAL_OK)
+    if (HAL_I2C_Mem_Write(&hi2c1, DS3231_ADDR, 0x00, I2C_MEMADD_SIZE_8BIT,
+                          buf, 7, 100) != HAL_OK)
     {
         return 0;
     }
@@ -932,32 +963,27 @@ uint8_t DS3231_SetTime(const DS3231_TimeTypeDef *t)
 
 static uint8_t IsLeapYear(uint16_t year)
 {
-    // Untuk rentang 2000..2099 cukup year%4==0
     return (year % 4U == 0U);
 }
 
 static uint32_t RTC_ToEpochSeconds(const DS3231_TimeTypeDef *t)
 {
-    // Hitung detik sejak 2000-01-01 00:00:00 (basis arbitrer, konsisten saja)
     static const uint8_t days_in_month[12] =
         {31,28,31,30,31,30,31,31,30,31,30,31};
 
     uint32_t days = 0;
 
-    // Tambah hari untuk tahun-tahun penuh sejak 2000
     for (uint16_t y = 2000; y < t->year; y++) {
         days += 365U + (IsLeapYear(y) ? 1U : 0U);
     }
 
-    // Tambah hari untuk bulan-bulan penuh di tahun berjalan
     for (uint8_t m = 1; m < t->month; m++) {
         days += days_in_month[m-1];
         if (m == 2 && IsLeapYear(t->year)) {
-            days += 1U;    // Feb 29
+            days += 1U;
         }
     }
 
-    // Tambah hari dalam bulan berjalan (day=1 berarti offset 0)
     days += (uint32_t)(t->day - 1U);
 
     uint32_t seconds =
@@ -969,13 +995,40 @@ static uint32_t RTC_ToEpochSeconds(const DS3231_TimeTypeDef *t)
     return seconds;
 }
 
-/* ===================== ADS1115 DRIVER (I2C2) ===================== */
-/*
- * Baca satu channel single-ended ADS1115
- * channel: 0..3 -> AIN0..AIN3
- * Mode: single-shot, PGA ±4.096V, 128 SPS
- */
+static void EpochToRTC(uint32_t epoch, DS3231_TimeTypeDef *t)
+{
+    static const uint8_t daysInMonth[12] =
+        {31,28,31,30,31,30,31,31,30,31,30,31};
 
+    uint32_t days = epoch / 86400;
+    uint32_t secs = epoch % 86400;
+
+    t->hours   = secs / 3600;
+    t->minutes = (secs % 3600) / 60;
+    t->seconds = secs % 60;
+
+    t->year = 2000;
+    while (1) {
+        uint16_t daysInYear = 365 + (IsLeapYear(t->year) ? 1 : 0);
+        if (days < daysInYear) break;
+        days -= daysInYear;
+        t->year++;
+    }
+
+    t->month = 1;
+    while (1) {
+        uint8_t dim = daysInMonth[t->month - 1];
+        if (t->month == 2 && IsLeapYear(t->year)) dim = 29;
+        if (days < dim) break;
+        days -= dim;
+        t->month++;
+    }
+
+    t->day = days + 1;
+    t->dayOfWeek = 1;
+}
+
+/* ==================== ADS1115 DRIVER ==================== */
 static int16_t ADS1115_ReadRaw(uint8_t ch)
 {
     uint8_t  cfg[3];
@@ -984,39 +1037,62 @@ static int16_t ADS1115_ReadRaw(uint8_t ch)
 
     config  = 0x8000U;
     config |= (uint16_t)((0x04U + ch) << 12);
-    config |= 0x0200U;   // ±4.096 V
-    config |= 0x0100U;   // single-shot
-    config |= 0x0080U;   // 128 SPS
-    config |= 0x0003U;   // disable comparator
+    config |= 0x0200U;
+    config |= 0x0100U;
+    config |= 0x0080U;
+    config |= 0x0003U;
 
     cfg[0] = 0x01;
     cfg[1] = (uint8_t)(config >> 8);
     cfg[2] = (uint8_t)(config & 0xFF);
 
-    if (HAL_I2C_Master_Transmit(&hi2c2, ADS1115_ADDR, cfg, 3, 100) != HAL_OK)
+    if (HAL_I2C_Master_Transmit(&hi2c2, ADS1115_ADDR, cfg, 3, 100) != HAL_OK) {
+        if (!g_err_ads) {
+            g_err_ads = 1;
+            Debug_ErrorJson("ADS", "I2C_TX_FAIL", "ADS1115 write config failed", 1);
+            SendErrorTLV(ERR_MOD_ADS, ERR_CODE_I2C_TX_FAIL, 1);
+        }
         return 0;
+    }
 
     HAL_Delay(8);
 
     cfg[0] = 0x00;
-    if (HAL_I2C_Master_Transmit(&hi2c2, ADS1115_ADDR, cfg, 1, 100) != HAL_OK)
+    if (HAL_I2C_Master_Transmit(&hi2c2, ADS1115_ADDR, cfg, 1, 100) != HAL_OK) {
+        if (!g_err_ads) {
+            g_err_ads = 1;
+            Debug_ErrorJson("ADS", "I2C_TX_FAIL", "ADS1115 select reg failed", 1);
+            SendErrorTLV(ERR_MOD_ADS, ERR_CODE_I2C_TX_FAIL, 1);
+        }
         return 0;
-    if (HAL_I2C_Master_Receive(&hi2c2, ADS1115_ADDR, rx, 2, 100) != HAL_OK)
+    }
+    if (HAL_I2C_Master_Receive(&hi2c2, ADS1115_ADDR, rx, 2, 100) != HAL_OK) {
+        if (!g_err_ads) {
+            g_err_ads = 1;
+            Debug_ErrorJson("ADS", "I2C_RX_FAIL", "ADS1115 read data failed", 1);
+            SendErrorTLV(ERR_MOD_ADS, ERR_CODE_I2C_RX_FAIL, 1);
+        }
         return 0;
+    }
+
+    if (g_err_ads) {
+        g_err_ads = 0;
+        Debug_ErrorJson("ADS", "OK", "ADS1115 back online", 0);
+        SendErrorTLV(ERR_MOD_ADS, ERR_CODE_OK, 0);
+    }
 
     return (int16_t)((rx[0] << 8) | rx[1]);
 }
 
-uint8_t VoltageToPWM_0_255(float voltage)
+static uint8_t VoltageToPWM_0_255(float voltage)
 {
-    // Batasi dulu ke 0..3.3 V
-    if (voltage < 0.0f)   voltage = 0.0f;
-    if (voltage > 3.3f)   voltage = 3.3f;
+    if (voltage < 0.0f) voltage = 0.0f;
+    if (voltage > 3.3f) voltage = 3.3f;
 
-    float scale = voltage / 3.3f;         // 0.0 .. 1.0
-    uint8_t pwm = (uint8_t)(scale * 255.0f + 0.5f);  // +0.5 untuk pembulatan
+    float scale = voltage / 3.3f;
+    uint8_t pwm = (uint8_t)(scale * 255.0f + 0.5f);
 
-    return pwm;   // 0..255
+    return pwm;
 }
 
 static float ADS1115_ConvertRawToVolt(int16_t raw)
@@ -1041,7 +1117,8 @@ static void ADS_Task(void)
     }
 }
 
-uint16_t CRC16_Modbus(uint8_t *data, uint16_t len)
+/* ==================== CRC16 MODBUS ==================== */
+static uint16_t CRC16_Modbus(const uint8_t *data, uint16_t len)
 {
     uint16_t crc = 0xFFFF;
 
@@ -1059,115 +1136,405 @@ uint16_t CRC16_Modbus(uint8_t *data, uint16_t len)
     return crc;
 }
 
-/*Callback UART ESP*/
+/* ==================== TLV ENCODER (for UART) ==================== */
+static size_t TLV_PutU8(uint8_t *buf, uint8_t tag, uint8_t val)
+{
+    buf[0] = tag;
+    buf[1] = 1;
+    buf[2] = val;
+    return 3;
+}
+
+static size_t TLV_PutU16(uint8_t *buf, uint8_t tag, uint16_t val)
+{
+    buf[0] = tag;
+    buf[1] = 2;
+    buf[2] = (uint8_t)(val >> 8);
+    buf[3] = (uint8_t)(val & 0xFF);
+    return 4;
+}
+
+static size_t TLV_PutI16(uint8_t *buf, uint8_t tag, int16_t val)
+{
+    buf[0] = tag;
+    buf[1] = 2;
+    buf[2] = (uint8_t)((uint16_t)val >> 8);
+    buf[3] = (uint8_t)((uint16_t)val & 0xFF);
+    return 4;
+}
+
+static size_t TLV_PutU32(uint8_t *buf, uint8_t tag, uint32_t val)
+{
+    buf[0] = tag;
+    buf[1] = 4;
+    buf[2] = (uint8_t)(val >> 24);
+    buf[3] = (uint8_t)(val >> 16);
+    buf[4] = (uint8_t)(val >> 8);
+    buf[5] = (uint8_t)(val & 0xFF);
+    return 6;
+}
+
+static size_t TLV_PutU16Array4(uint8_t *buf, uint8_t tag, const uint16_t arr[4])
+{
+    buf[0] = tag;
+    buf[1] = 8;
+    for (int i = 0; i < 4; i++) {
+        buf[2 + i*2]     = (uint8_t)(arr[i] >> 8);
+        buf[2 + i*2 + 1] = (uint8_t)(arr[i] & 0xFF);
+    }
+    return 10;
+}
+
+static size_t TLV_EncodeMeasurement(const Measurement_t *m, uint8_t *out, size_t maxLen)
+{
+    if (maxLen < 48) return 0;
+
+    size_t idx = 0;
+
+    // Calculate timestamp epoch from RTC
+    uint32_t timestamp = RTC_ToEpochSeconds(&m->rtc);
+
+    idx += TLV_PutU32(&out[idx], TLV_TAG_SEQ, m->seq);
+    idx += TLV_PutU32(&out[idx], TLV_TAG_TIMESTAMP, timestamp);
+    idx += TLV_PutI16(&out[idx], TLV_TAG_TEMP, m->temp);
+    idx += TLV_PutI16(&out[idx], TLV_TAG_HUM, m->hum);
+    idx += TLV_PutU16(&out[idx], TLV_TAG_DIG_IN, m->dig_in);
+    idx += TLV_PutU16Array4(&out[idx], TLV_TAG_AN_IN, m->an_in);
+    idx += TLV_PutU8(&out[idx], TLV_TAG_Q, m->q);
+
+    return idx;
+}
+
+static void SendErrorTLV(uint8_t moduleId, uint8_t code, uint8_t active)
+{
+    uint8_t payload[16];
+    size_t idx = 0;
+
+    // TAG_ERR_MODULE
+    payload[idx++] = TLV_TAG_ERR_MODULE;
+    payload[idx++] = 1;
+    payload[idx++] = moduleId;
+
+    // TAG_ERR_CODE
+    payload[idx++] = TLV_TAG_ERR_CODE;
+    payload[idx++] = 1;
+    payload[idx++] = code;
+
+    // TAG_ERR_ACTIVE
+    payload[idx++] = TLV_TAG_ERR_ACTIVE;
+    payload[idx++] = 1;
+    payload[idx++] = active;
+
+    uint8_t frame[32];
+    uint16_t fidx = 0;
+
+    frame[fidx++] = TLV_SOF;
+    frame[fidx++] = FRAME_TYPE_ERROR;
+    frame[fidx++] = (idx >> 8) & 0xFF;
+    frame[fidx++] = idx & 0xFF;
+
+    memcpy(&frame[fidx], payload, idx);
+    fidx += idx;
+
+    uint16_t crc = CRC16_Modbus(frame, fidx);
+    frame[fidx++] = (crc >> 8) & 0xFF;
+    frame[fidx++] = crc & 0xFF;
+
+    // Kirim blocking; frame kecil
+    HAL_UART_Transmit(&huart2, frame, fidx, 100);
+}
+
+static bool SendMeasurementTLV(const Measurement_t *m)
+{
+    uint8_t tlvPayload[64];
+    size_t tlvLen = TLV_EncodeMeasurement(m, tlvPayload, sizeof(tlvPayload));
+    if (tlvLen == 0) {
+        UART_Print("[TX] TLV encode failed\r\n");
+        return false;
+    }
+
+    uint8_t frame[UART_FRAME_MAX_LEN];
+    uint16_t idx = 0;
+
+    frame[idx++] = TLV_SOF;
+    frame[idx++] = FRAME_TYPE_DATA;
+    frame[idx++] = (tlvLen >> 8) & 0xFF;
+    frame[idx++] = tlvLen & 0xFF;
+
+    memcpy(&frame[idx], tlvPayload, tlvLen);
+    idx += tlvLen;
+
+    uint16_t crc = CRC16_Modbus(frame, idx);
+    frame[idx++] = (crc >> 8) & 0xFF;
+    frame[idx++] = crc & 0xFF;
+
+    if (HAL_UART_Transmit(&huart2, frame, idx, 200) != HAL_OK) {
+        UART_Print("[TX] UART transmit failed\r\n");
+        return false;
+    }
+
+    snprintf(g_debugBuf, sizeof(g_debugBuf),
+             "[TX] Sent TLV seq=%lu len=%u\r\n",
+             (unsigned long)m->seq, (unsigned)tlvLen);
+    UART_Print(g_debugBuf);
+
+    return true;
+}
+
+/* ==================== TLV PARSER (from ESP32) ==================== */
+static uint16_t TLV_ReadU16BE(const uint8_t *p)
+{
+    return ((uint16_t)p[0] << 8) | p[1];
+}
+
+static uint32_t TLV_ReadU32BE(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) |
+           ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8)  |
+           p[3];
+}
+
+/* ==================== JSON ENCODER (for SD & Debug) ==================== */
+static size_t JSON_EncodeMeasurement(const Measurement_t *m, char *out, size_t maxLen)
+{
+    char ts[32];
+    char digArr[64];
+    char anArr[32];
+    char qArr[24];
+    char *p;
+    int n;
+
+    // 1) Build timestamp string "YYYY-MM-DDTHH:MM:SSZ"
+    snprintf(ts, sizeof(ts), "%04u-%02u-%02uT%02u:%02u:%02uZ",
+             m->rtc.year, m->rtc.month, m->rtc.day,
+             m->rtc.hours, m->rtc.minutes, m->rtc.seconds);
+
+    // 2) Build dig_in array string [1,0,1,0,...]
+    p = digArr;
+    *p++ = '[';
+    for (uint8_t i = 0; i < NUM_INPUTS; i++) {
+        uint8_t bit = (m->dig_in & (1U << i)) ? 1 : 0;
+        n = snprintf(p, sizeof(digArr) - (p - digArr), "%u%s",
+                     bit, (i < NUM_INPUTS - 1) ? "," : "");
+        if (n > 0) p += n;
+    }
+    *p++ = ']';
+    *p = '\0';
+
+    // 3) Build an_in array string [255,255,255,255]
+    snprintf(anArr, sizeof(anArr), "[%u,%u,%u,%u]",
+             m->an_in[0], m->an_in[1], m->an_in[2], m->an_in[3]);
+
+    // 4) Build q array string [0,1,0,1]
+    p = qArr;
+    *p++ = '[';
+    for (uint8_t i = 0; i < NUM_OUTPUTS; i++) {
+        uint8_t bit = (m->q & (1U << i)) ? 1 : 0;
+        n = snprintf(p, sizeof(qArr) - (p - qArr), "%u%s",
+                     bit, (i < NUM_OUTPUTS - 1) ? "," : "");
+        if (n > 0) p += n;
+    }
+    *p++ = ']';
+    *p = '\0';
+
+    // 5) Build complete JSON
+    int len = snprintf(out, maxLen,
+        "{\"timestamp\":\"%s\","
+        "\"env\":{\"temp\":%.1f,\"hum\":%.1f},"
+        "\"dig_in\":%s,"
+        "\"an_in\":%s,"
+        "\"q\":%s,"
+        "\"seq\":%lu}\n",
+        ts,
+        m->temp / 10.0f,
+        m->hum / 10.0f,
+        digArr,
+        anArr,
+        qArr,
+        (unsigned long)m->seq
+    );
+
+    if (len < 0 || (size_t)len >= maxLen) return 0;
+    return (size_t)len;
+}
+
+static bool JSON_ParseSeqFromLine(const char *line, uint32_t *outSeq)
+{
+    const char *p = strstr(line, "\"seq\":");
+    if (!p) return false;
+
+    p += 6;
+    *outSeq = (uint32_t)strtoul(p, NULL, 10);
+    return (*outSeq > 0);
+}
+
+static bool JSON_ParseToMeasurement(const char *json, Measurement_t *m)
+{
+    memset(m, 0, sizeof(*m));
+    const char *p;
+
+    // 1) Parse seq
+    p = strstr(json, "\"seq\":");
+    if (p) m->seq = (uint32_t)strtoul(p + 6, NULL, 10);
+
+    // 2) Parse timestamp "YYYY-MM-DDTHH:MM:SSZ"
+    p = strstr(json, "\"timestamp\":\"");
+    if (p) {
+        p += 13;
+        int Y, M, D, h, mi, s;
+        if (sscanf(p, "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &mi, &s) == 6) {
+            m->rtc.year    = (uint16_t)Y;
+            m->rtc.month   = (uint8_t)M;
+            m->rtc.day     = (uint8_t)D;
+            m->rtc.hours   = (uint8_t)h;
+            m->rtc.minutes = (uint8_t)mi;
+            m->rtc.seconds = (uint8_t)s;
+        }
+    }
+
+    // 3) Parse env.temp
+    p = strstr(json, "\"temp\":");
+    if (p) {
+        float f = strtof(p + 7, NULL);
+        m->temp = (int16_t)(f * 10.0f);
+    }
+
+    // 4) Parse env.hum
+    p = strstr(json, "\"hum\":");
+    if (p) {
+        float f = strtof(p + 6, NULL);
+        m->hum = (int16_t)(f * 10.0f);
+    }
+
+    // 5) Parse dig_in array
+    p = strstr(json, "\"dig_in\":[");
+    if (p) {
+        p += 10;
+        m->dig_in = 0;
+        for (uint8_t i = 0; i < NUM_INPUTS && *p; i++) {
+            while (*p == ' ') p++;
+            if (*p == '1') {
+                m->dig_in |= (1U << i);
+            }
+            while (*p && *p != ',' && *p != ']') p++;
+            if (*p == ',') p++;
+        }
+    }
+
+    // 6) Parse an_in array
+    p = strstr(json, "\"an_in\":[");
+    if (p) {
+        p += 9;
+        for (int i = 0; i < 4 && *p; i++) {
+            m->an_in[i] = (uint16_t)strtoul(p, (char**)&p, 10);
+            if (*p == ',') p++;
+        }
+    }
+
+    // 7) Parse q array
+    p = strstr(json, "\"q\":[");
+    if (p) {
+        p += 5;
+        m->q = 0;
+        for (uint8_t i = 0; i < NUM_OUTPUTS && *p; i++) {
+            while (*p == ' ') p++;
+            if (*p == '1') {
+                m->q |= (1U << i);
+            }
+            while (*p && *p != ',' && *p != ']') p++;
+            if (*p == ',') p++;
+        }
+    }
+
+    return (m->seq > 0);
+}
+
+/* ==================== UART CALLBACKS ==================== */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-    if (huart == &huart2)   // UART2 = link ke ESP32
+    if (huart == &huart2)
     {
-        uint8_t b = rxByte;
+        uint8_t b = g_rxByte;
 
-        if (ruleFrameIdx == 0)
+        if (g_frameIdx == 0)
         {
-            // Cari SOF
-            if (b != SOF_BYTE)
+            if (b == TLV_SOF)
             {
-                // buang byte sampai ketemu 0x7E
-            }
-            else
-            {
-                ruleFrameBuf[0] = b;
-                ruleFrameIdx    = 1;
-                ruleExpectedLen = -1;
+                g_frameBuf[0] = b;
+                g_frameIdx    = 1;
+                g_expectedLen = -1;
             }
         }
         else
         {
-            if (ruleFrameIdx < RX_BUF_SIZE)
+            if (g_frameIdx < RX_BUF_SIZE)
             {
-                ruleFrameBuf[ruleFrameIdx++] = b;
+                g_frameBuf[g_frameIdx++] = b;
             }
             else
             {
-                // overflow, reset parser
-                ruleFrameIdx    = 0;
-                ruleExpectedLen = -1;
+                g_frameIdx    = 0;
+                g_expectedLen = -1;
             }
 
-            // Setelah punya SOF + LEN_H + LEN_L (3 byte)
-            if (ruleFrameIdx == 3)
+            // After SOF + TYPE + LEN_H + LEN_L (4 bytes)
+            if (g_frameIdx == 4)
             {
-                uint16_t jsonLen = ((uint16_t)ruleFrameBuf[1] << 8) | ruleFrameBuf[2];
-                if (jsonLen > RULE_MAX_PAYLOAD)
+                uint16_t payloadLen = ((uint16_t)g_frameBuf[2] << 8) | g_frameBuf[3];
+                if (payloadLen > RULE_MAX_PAYLOAD)
                 {
-                    // payload tidak masuk akal, reset
-                    ruleFrameIdx    = 0;
-                    ruleExpectedLen = -1;
+                    g_frameIdx    = 0;
+                    g_expectedLen = -1;
                 }
                 else
                 {
-                    // total = 1(SOF) + 2(LEN) + JSON + 2(CRC)
-                    ruleExpectedLen = 1 + 2 + jsonLen + 2;
+                    g_expectedLen = 4 + payloadLen + 2;
                 }
             }
 
-            // Kalau frame lengkap, proses
-            if (ruleExpectedLen > 0 && ruleFrameIdx == ruleExpectedLen)
+            if (g_expectedLen > 0 && g_frameIdx == g_expectedLen)
             {
-                uint16_t jsonLen = ((uint16_t)ruleFrameBuf[1] << 8) | ruleFrameBuf[2];
+                uint16_t payloadLen = ((uint16_t)g_frameBuf[2] << 8) | g_frameBuf[3];
 
-                // cek CRC
-                uint16_t crcRecv = ((uint16_t)ruleFrameBuf[ruleFrameIdx-2] << 8) |
-                                    ruleFrameBuf[ruleFrameIdx-1];
-                uint16_t crcCalc = CRC16_Modbus(ruleFrameBuf, ruleFrameIdx-2);
+                uint16_t crcRecv = ((uint16_t)g_frameBuf[g_frameIdx-2] << 8) |
+                                    g_frameBuf[g_frameIdx-1];
+                uint16_t crcCalc = CRC16_Modbus(g_frameBuf, g_frameIdx-2);
 
                 if (crcRecv == crcCalc)
                 {
-                    // panggil handler dengan payload JSON saja
-                    OnRuleFrameReceived(&ruleFrameBuf[3], jsonLen);
-                }
-                else
-                {
-                    // CRC salah -> abaikan; bisa tambahkan debug ke USART1
-                     sprintf(buf, "[RULE] CRC error: recv=0x%04X calc=0x%04X\r\n", crcRecv, crcCalc);
-                     HAL_UART_Transmit(&huart1, (uint8_t*)buf, strlen(buf), 100);
+                    uint8_t frameType = g_frameBuf[1];
+                    OnFrameReceived(&g_frameBuf[4], payloadLen, frameType);
                 }
 
-                // reset parser
-                ruleFrameIdx    = 0;
-                ruleExpectedLen = -1;
+                g_frameIdx    = 0;
+                g_expectedLen = -1;
             }
         }
 
-        // lanjut terima 1 byte lagi
-        HAL_UART_Receive_IT(&huart2, &rxByte, 1);
+        HAL_UART_Receive_IT(&huart2, &g_rxByte, 1);
     }
 
     if (huart == &huart1)
     {
-    	uint8_t b = rs485RxByte;
+        uint8_t b = g_rs485RxByte;
 
-        // contoh sederhana: kumpulkan sampai '\n'
-        if (rs485Idx < sizeof(rs485Buf) - 1)
+        if (g_rs485Idx < sizeof(g_rs485Buf) - 1)
         {
-        	rs485Buf[rs485Idx++] = b;
+            g_rs485Buf[g_rs485Idx++] = b;
         }
 
         if (b == '\n')
         {
-            rs485Buf[rs485Idx] = '\0';
-            rs485Idx = 0;
-
-            // Di sini proses perintah dari RS485
-            // Contoh: kirim balik apa adanya
-            HAL_UART_Transmit(&huart1, (uint8_t*)"ECHO: ", 6, 100);
-            HAL_UART_Transmit(&huart1, rs485Buf, strlen((char*)rs485Buf), 100);
+            g_rs485Buf[g_rs485Idx] = '\0';
+            g_rs485Idx = 0;
         }
 
-        // mulai terima byte berikutnya
-        HAL_UART_Receive_IT(&huart1, &rs485RxByte, 1);
+        HAL_UART_Receive_IT(&huart1, &g_rs485RxByte, 1);
     }
 }
 
+/* ==================== RULES ==================== */
 static void Rules_Reset(void)
 {
     for (int q = 0; q < NUM_OUTPUTS; q++)
@@ -1180,23 +1547,19 @@ static void Rules_Reset(void)
 
 static void ParseOneRuleString(const char *ruleStr)
 {
-    if (ruleStr == NULL) return;
-    if (ruleStr[0] != 'Q') return;      // harus mulai dengan Q
+    if (ruleStr == NULL || ruleStr[0] != 'Q') return;
 
-    int qNum = atoi(&ruleStr[1]);       // Q1 -> 1
-    if (qNum < 1 || qNum > NUM_OUTPUTS) return;
-    int qIdx = qNum - 1;                // index 0..3
+    int qNum = atoi(&ruleStr[1]);
+    if (qNum < 1 || qNum > (int)NUM_OUTPUTS) return;
+    int qIdx = qNum - 1;
 
-    // cari ':' pertama (setelah Qx)
     const char *p = strchr(ruleStr, ':');
     if (!p) return;
-    p++;                                // awal string LOGIC
+    p++;
 
-    // cari ':' kedua (setelah LOGIC)
     const char *p2 = strchr(p, ':');
     if (!p2) return;
 
-    // ambil kata LOGIC
     char logicStr[8] = {0};
     size_t logicLen = (size_t)(p2 - p);
     if (logicLen >= sizeof(logicStr))
@@ -1212,21 +1575,19 @@ static void ParseOneRuleString(const char *ruleStr)
     g_rules[qIdx].logic      = logic;
     g_rules[qIdx].inputCount = 0;
 
-    // sisa setelah ':' kedua adalah daftar input: "I1,I2,I3"
     const char *r = p2 + 1;
     while (*r != '\0')
     {
         if (*r == 'I')
         {
-            int inNum = atoi(r + 1);  // I1 -> 1, I10 -> 10
-            if (inNum >= 1 && inNum <= NUM_INPUTS)
+            int inNum = atoi(r + 1);
+            if (inNum >= 1 && inNum <= (int)NUM_INPUTS)
             {
                 if (g_rules[qIdx].inputCount < NUM_INPUTS)
                 {
                     g_rules[qIdx].inputs[g_rules[qIdx].inputCount++] = (uint8_t)inNum;
                 }
             }
-            // lompat sampai koma atau akhir string
             while (*r && *r != ',' && *r != '\0') r++;
         }
         else
@@ -1236,71 +1597,94 @@ static void ParseOneRuleString(const char *ruleStr)
     }
 }
 
-void ParseRuleJSON(char *json)
+static void ParseRulesTLV(const uint8_t *tlv, size_t len)
 {
     Rules_Reset();
-    if (json == NULL) return;
 
-    // cari key "rules"
-    char *p = strstr(json, "\"rules\"");
-    if (!p) return;
+    size_t i = 0;
+    while (i + 2 <= len) {
+        uint8_t tag = tlv[i];
+        uint8_t l   = tlv[i + 1];
 
-    // cari '[' setelah "rules"
-    p = strchr(p, '[');
-    if (!p) return;
-    p++;    // masuk ke dalam array
+        if (i + 2 + l > len) break;
 
-    while (*p && *p != ']')
-    {
-        // cari tanda kutip pembuka
-        while (*p && *p != '"' && *p != ']') p++;
-        if (*p == ']')
-            break;
-        p++;   // setelah '"'
-
-        char *start = p;
-        // cari tanda kutip penutup
-        while (*p && *p != '"') p++;
-        if (*p != '"')
-            break;
-
-        size_t len = (size_t)(p - start);
-        if (len > 0 && len < RULE_STR_MAX_LEN)
-        {
-            char oneRule[RULE_STR_MAX_LEN];
-            memcpy(oneRule, start, len);
-            oneRule[len] = '\0';
-
-            // contoh oneRule: "Q1:OR:I1,I2"
-            ParseOneRuleString(oneRule);
+        if (tag == TAG_RULE) {
+            char ruleStr[RULE_STR_MAX_LEN];
+            size_t copyLen = (l < RULE_STR_MAX_LEN - 1) ? l : (RULE_STR_MAX_LEN - 1);
+            memcpy(ruleStr, &tlv[i + 2], copyLen);
+            ruleStr[copyLen] = '\0';
+            ParseOneRuleString(ruleStr);
         }
 
-        if (*p == '"') p++;  // lewati tanda kutip penutup
+        i += 2 + l;
     }
 
-    // tandai ke main loop bahwa rules baru
     g_ruleUpdated = 1;
+}
+
+static void ParseRTCTLV(const uint8_t *tlv, size_t len)
+{
+    size_t i = 0;
+    while (i + 2 <= len) {
+        uint8_t tag = tlv[i];
+        uint8_t l   = tlv[i + 1];
+
+        if (i + 2 + l > len) break;
+
+        if (tag == TAG_RTC_TS && l == 4) {
+            uint32_t epoch = TLV_ReadU32BE(&tlv[i + 2]);
+            DS3231_TimeTypeDef t;
+            EpochToRTC(epoch, &t);
+
+            if (DS3231_SetTime(&t)) {
+                UART_Print("[RTC] Set from ESP32 OK\r\n");
+            } else {
+                UART_Print("[RTC] Set FAILED\r\n");
+            }
+        }
+
+        i += 2 + l;
+    }
+}
+
+static void ParseACKTLV(const uint8_t *tlv, size_t len)
+{
+    size_t i = 0;
+    while (i + 2 <= len) {
+        uint8_t tag = tlv[i];
+        uint8_t l   = tlv[i + 1];
+
+        if (i + 2 + l > len) break;
+
+        if (tag == TLV_TAG_SEQ && l == 4) {
+            g_ack_seq = TLV_ReadU32BE(&tlv[i + 2]);
+            g_ack_pending = 1;
+
+            snprintf(g_debugBuf, sizeof(g_debugBuf),
+                     "[ACK] Received seq=%lu\r\n", (unsigned long)g_ack_seq);
+            UART_Print(g_debugBuf);
+        }
+
+        i += 2 + l;
+    }
 }
 
 static uint8_t EvalOutputState(int qIdx, uint16_t inputMask)
 {
     RuleDef_t *r = &g_rules[qIdx];
 
-    // Jika OFF atau tidak ada input → selalu 0
     if (r->logic == RULE_LOGIC_OFF || r->inputCount == 0)
         return 0;
 
     if (r->logic == RULE_LOGIC_NOT)
     {
-        // NOT hanya pakai input pertama
-        uint8_t in = r->inputs[0];   // 1..11
+        uint8_t in = r->inputs[0];
         uint8_t state = (inputMask & (1U << (in - 1))) ? 1 : 0;
-        return !state;               // output ON kalau input OFF
+        return !state;
     }
 
     if (r->logic == RULE_LOGIC_OR)
     {
-        // ON jika ADA satu input yang ON
         for (uint8_t i = 0; i < r->inputCount; i++)
         {
             uint8_t in = r->inputs[i];
@@ -1312,12 +1696,11 @@ static uint8_t EvalOutputState(int qIdx, uint16_t inputMask)
 
     if (r->logic == RULE_LOGIC_AND)
     {
-        // ON jika SEMUA input ON
         for (uint8_t i = 0; i < r->inputCount; i++)
         {
             uint8_t in = r->inputs[i];
             if (!(inputMask & (1U << (in - 1))))
-                return 0;  // ada yang OFF
+                return 0;
         }
         return 1;
     }
@@ -1325,39 +1708,19 @@ static uint8_t EvalOutputState(int qIdx, uint16_t inputMask)
     return 0;
 }
 
-void ApplyRules(uint16_t inputMask)
+static void ApplyRules(uint16_t inputMask)
 {
     for (int q = 0; q < NUM_OUTPUTS; q++)
     {
         uint8_t on = EvalOutputState(q, inputMask);
-
-        HAL_GPIO_WritePin(
-            g_outputs[q].Port,
-            g_outputs[q].Pin,
-            on ? GPIO_PIN_SET : GPIO_PIN_RESET
-        );
+        HAL_GPIO_WritePin(g_outputs[q].Port, g_outputs[q].Pin,
+                          on ? GPIO_PIN_SET : GPIO_PIN_RESET);
     }
 }
 
-
-void PrintRuleStatus(void)
+static void PrintRuleStatus(void)
 {
-    char msg[128];
-
-    // Cetak RAW JSON rules dari ESP
-    HAL_UART_Transmit(&huart1,
-        (uint8_t*)"[RULE] RAW JSON:\r\n",
-        sizeof("[RULE] RAW JSON:\r\n")-1, 100);
-    HAL_UART_Transmit(&huart1,
-        (uint8_t*)ruleJsonRaw,
-        strlen(ruleJsonRaw), 100);
-    HAL_UART_Transmit(&huart1,
-        (uint8_t*)"\r\n",
-        2, 100);
-
-    HAL_UART_Transmit(&huart1,
-        (uint8_t*)"[RULE] Parsed rules:\r\n",
-        sizeof("[RULE] Parsed rules:\r\n")-1, 100);
+    UART_Print("[RULE] Current configuration:\r\n");
 
     for (int q = 0; q < NUM_OUTPUTS; q++)
     {
@@ -1368,395 +1731,235 @@ void PrintRuleStatus(void)
         else if (r->logic == RULE_LOGIC_AND) logicName = "AND";
         else if (r->logic == RULE_LOGIC_NOT) logicName = "NOT";
 
-        int len = snprintf(msg, sizeof(msg), "  Q%d: %s (", q + 1, logicName);
+        int len = snprintf(g_debugBuf, sizeof(g_debugBuf),
+                           "  Q%d: %s (", q + 1, logicName);
 
         for (uint8_t i = 0; i < r->inputCount; i++)
         {
-            len += snprintf(msg + len, sizeof(msg) - len,
-                            "I%u%s",
-                            r->inputs[i],
+            len += snprintf(g_debugBuf + len, sizeof(g_debugBuf) - len,
+                            "I%u%s", r->inputs[i],
                             (i == r->inputCount - 1) ? "" : ",");
         }
-        snprintf(msg + len, sizeof(msg) - len, ")\r\n");
-
-        HAL_UART_Transmit(&huart1,
-            (uint8_t*)msg, strlen(msg), 100);
+        snprintf(g_debugBuf + len, sizeof(g_debugBuf) - len, ")\r\n");
+        UART_Print(g_debugBuf);
     }
 }
 
-
-/*Timetemp set ESP*/
-void ParseRTCJSON(const char *json)
+static void OnFrameReceived(uint8_t *payload, uint16_t len, uint8_t frameType)
 {
-    if (json == NULL) return;
+    snprintf(g_debugBuf, sizeof(g_debugBuf),
+             "[RX] Frame type=0x%02X len=%u\r\n", frameType, len);
+    UART_Print(g_debugBuf);
 
-    // cari key "rtc_set"
-    const char *p = strstr(json, "\"rtc_set\"");
-    if (!p) return;
+    switch (frameType) {
+        case FRAME_TYPE_RULES:
+//            Debug_DumpTLV("[RX][RULES]", payload, len);
+            ParseRulesTLV(payload, len);
+            break;
 
-    p = strchr(p, ':');
-    if (!p) return;
-    p++;  // setelah ':'
+        case FRAME_TYPE_RTC:
+//            Debug_DumpTLV("[RX][RTC]", payload, len);
+            ParseRTCTLV(payload, len);
+            break;
 
-    // skip spasi dan tanda kutip
-    while (*p == ' ' || *p == '\"') p++;
+        case FRAME_TYPE_ACK:
+//            Debug_DumpTLV("[RX][ACK]", payload, len);
+            ParseACKTLV(payload, len);
+            break;
 
-    char dt[32] = {0};
-    int i = 0;
-    while (*p && *p != '\"' && *p != '}' && i < (int)(sizeof(dt) - 1))
-    {
-        dt[i++] = *p++;
-    }
-    dt[i] = '\0';
-
-    // Format yang kita harapkan: "YYYY-MM-DD HH:MM:SS"
-    int Y, M, D, h, m, s;
-    if (sscanf(dt, "%d-%d-%d %d:%d:%d", &Y, &M, &D, &h, &m, &s) != 6)
-    {
-        const char *msg = "[RTC] Bad datetime format\r\n";
-        HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
-        return;
-    }
-
-    DS3231_TimeTypeDef t;
-    t.year   = (uint16_t)Y;
-    t.month  = (uint8_t)M;
-    t.day    = (uint8_t)D;
-    t.hours  = (uint8_t)h;
-    t.minutes= (uint8_t)m;
-    t.seconds= (uint8_t)s;
-
-    // dayOfWeek bisa diabaikan atau diisi 1..7 sembarang
-    t.dayOfWeek = 1;
-
-    if (DS3231_SetTime(&t))
-    {
-        const char *ok = "[RTC] Time updated from ESP32\r\n";
-        HAL_UART_Transmit(&huart1, (uint8_t*)ok, strlen(ok), 100);
-    }
-    else
-    {
-        const char *er = "[RTC] DS3231_SetTime failed\r\n";
-        HAL_UART_Transmit(&huart1, (uint8_t*)er, strlen(er), 100);
+        default:
+            UART_Print("[RX] Unknown frame type\r\n");
+            break;
     }
 }
 
-void OnRuleFrameReceived(uint8_t *payload, uint16_t len)
+/* ==================== SD CARD & LOG (JSON format) ==================== */
+static void Log_InitRuntime(void)
 {
-    if (len >= RX_BUF_SIZE)
-        len = RX_BUF_SIZE - 1;
-
-    memcpy(ruleJsonRaw, payload, len);
-    ruleJsonRaw[len] = '\0';
-
-    // Debug: tampilkan JSON mentah
-    HAL_UART_Transmit(&huart1,
-        (uint8_t*)"[STM] Frame from ESP:\r\n",
-        sizeof("[STM] Frame from ESP:\r\n")-1, 100);
-    HAL_UART_Transmit(&huart1,
-        (uint8_t*)ruleJsonRaw,
-        strlen(ruleJsonRaw), 100);
-    HAL_UART_Transmit(&huart1,
-        (uint8_t*)"\r\n",
-        2, 100);
-
-    if (strstr(ruleJsonRaw, "\"rules\""))
-    {
-        // frame untuk konfigurasi rules
-        ParseRuleJSON(ruleJsonRaw);
-        g_ruleUpdated = 1;
-    }
-    else if (strstr(ruleJsonRaw, "\"rtc_set\""))
-    {
-        // frame untuk set RTC
-        ParseRTCJSON(ruleJsonRaw);
-    }
-    else
-    {
-        const char *msg = "[STM] Unknown JSON payload\r\n";
-        HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
-    }
+    g_sd_mounted = 0;
+    g_nextSeq    = 1;
 }
 
-// ---- CBOR helpers (subset yang kita butuh) ----
-static size_t cbor_put_uint(uint8_t *buf, size_t max, uint32_t value)
+static bool SD_MountTask(void)
 {
-    if (value <= 23) {
-        if (max < 1) return 0;
-        buf[0] = (uint8_t)(0x00 | value);
-        return 1;
-    } else if (value <= 0xFF) {
-        if (max < 2) return 0;
-        buf[0] = 0x18;
-        buf[1] = (uint8_t)value;
-        return 2;
-    } else if (value <= 0xFFFF) {
-        if (max < 3) return 0;
-        buf[0] = 0x19;
-        buf[1] = (uint8_t)(value >> 8);
-        buf[2] = (uint8_t)value;
-        return 3;
+    if (g_sd_mounted) return true;
+
+    FRESULT fr = f_mount(&USERFatFS, (TCHAR const*)USERPath, 1);
+    if (fr == FR_OK) {
+        g_sd_mounted = 1;
+        if (g_err_sd) {
+            g_err_sd = 0;
+            Debug_ErrorJson("SD", "MOUNT_OK", "SD card mounted", 0);
+            SendErrorTLV(ERR_MOD_SD, ERR_CODE_OK, 0);
+        }
+        UART_Print("[SD] Mounted OK\r\n");
+        return true;
     } else {
-        if (max < 5) return 0;
-        buf[0] = 0x1A;
-        buf[1] = (uint8_t)(value >> 24);
-        buf[2] = (uint8_t)(value >> 16);
-        buf[3] = (uint8_t)(value >> 8);
-        buf[4] = (uint8_t)value;
-        return 5;
-    }
-}
-
-static size_t cbor_put_text(uint8_t *buf, size_t max, const char *str)
-{
-    size_t len = strlen(str);
-    if (len > 0xFFFF) return 0;
-    size_t idx = 0;
-
-    if (len <= 23) {
-        if (max < 1 + len) return 0;
-        buf[idx++] = (uint8_t)(0x60 | len);
-    } else if (len <= 0xFF) {
-        if (max < 2 + len) return 0;
-        buf[idx++] = 0x78;
-        buf[idx++] = (uint8_t)len;
-    } else {
-        if (max < 3 + len) return 0;
-        buf[idx++] = 0x79;
-        buf[idx++] = (uint8_t)(len >> 8);
-        buf[idx++] = (uint8_t)len;
-    }
-    memcpy(&buf[idx], str, len);
-    return idx + len;
-}
-
-static size_t cbor_put_array_hdr(uint8_t *buf, size_t max, uint32_t count)
-{
-    if (count <= 23) {
-        if (max < 1) return 0;
-        buf[0] = (uint8_t)(0x80 | count);
-        return 1;
-    } else if (count <= 0xFF) {
-        if (max < 2) return 0;
-        buf[0] = 0x98;
-        buf[1] = (uint8_t)count;
-        return 2;
-    }
-    return 0;
-}
-
-static size_t cbor_put_map_hdr(uint8_t *buf, size_t max, uint32_t count)
-{
-    if (count <= 23) {
-        if (max < 1) return 0;
-        buf[0] = (uint8_t)(0xA0 | count);
-        return 1;
-    } else if (count <= 0xFF) {
-        if (max < 2) return 0;
-        buf[0] = 0xB8;
-        buf[1] = (uint8_t)count;
-        return 2;
-    }
-    return 0;
-}
-
-static size_t cbor_put_float32(uint8_t *buf, size_t max, float value)
-{
-    if (max < 5) return 0;
-    buf[0] = 0xFA; // simple value, float32
-    uint32_t u;
-    memcpy(&u, &value, sizeof(u));
-    buf[1] = (uint8_t)(u >> 24);
-    buf[2] = (uint8_t)(u >> 16);
-    buf[3] = (uint8_t)(u >> 8);
-    buf[4] = (uint8_t)(u);
-    return 5;
-}
-
-// Encode Measurement_t -> CBOR map dengan 6 key: timestamp, env, dig_in, an_in, q, seq
-size_t CBOR_EncodeMeasurement(const Measurement_t *m, uint8_t *out, size_t max_len)
-{
-    size_t idx = 0, n;
-
-    // map(6)
-    n = cbor_put_map_hdr(&out[idx], max_len - idx, 6);
-    if (!n) return 0;
-    idx += n;
-
-    // "timestamp": "YYYY-..Z"
-    char ts[32];
-    snprintf(ts, sizeof(ts), "%04u-%02u-%02uT%02u:%02u:%02uZ",
-             m->rtc.year, m->rtc.month, m->rtc.day,
-             m->rtc.hours, m->rtc.minutes, m->rtc.seconds);
-
-    n = cbor_put_text(&out[idx], max_len - idx, "timestamp");
-    if (!n) return 0;
-    idx += n;
-    n = cbor_put_text(&out[idx], max_len - idx, ts);
-    if (!n) return 0;
-    idx += n;
-
-    // "env": { "temp":..., "hum":... }
-    n = cbor_put_text(&out[idx], max_len - idx, "env");
-    if (!n) return 0;
-    idx += n;
-    n = cbor_put_map_hdr(&out[idx], max_len - idx, 2);
-    if (!n) return 0;
-    idx += n;
-
-    n = cbor_put_text(&out[idx], max_len - idx, "temp");
-    if (!n) return 0;
-    idx += n;
-    n = cbor_put_float32(&out[idx], max_len - idx, m->temp);
-    if (!n) return 0;
-    idx += n;
-
-    n = cbor_put_text(&out[idx], max_len - idx, "hum");
-    if (!n) return 0;
-    idx += n;
-    n = cbor_put_float32(&out[idx], max_len - idx, m->hum);
-    if (!n) return 0;
-    idx += n;
-
-    // "dig_in": [..]
-    n = cbor_put_text(&out[idx], max_len - idx, "dig_in");
-    if (!n) return 0;
-    idx += n;
-    n = cbor_put_array_hdr(&out[idx], max_len - idx, NUM_INPUTS);
-    if (!n) return 0;
-    idx += n;
-    for (int i = 0; i < NUM_INPUTS; i++) {
-        n = cbor_put_uint(&out[idx], max_len - idx, m->dig_in[i]);
-        if (!n) return 0;
-        idx += n;
-    }
-
-    // "an_in": [..]
-    n = cbor_put_text(&out[idx], max_len - idx, "an_in");
-    if (!n) return 0;
-    idx += n;
-    n = cbor_put_array_hdr(&out[idx], max_len - idx, NUM_ANALOG);
-    if (!n) return 0;
-    idx += n;
-    for (int i = 0; i < NUM_ANALOG; i++) {
-        n = cbor_put_uint(&out[idx], max_len - idx, m->an_in[i]);
-        if (!n) return 0;
-        idx += n;
-    }
-
-    // "q": [..]
-    n = cbor_put_text(&out[idx], max_len - idx, "q");
-    if (!n) return 0;
-    idx += n;
-    n = cbor_put_array_hdr(&out[idx], max_len - idx, NUM_OUTPUTS);
-    if (!n) return 0;
-    idx += n;
-    for (int i = 0; i < NUM_OUTPUTS; i++) {
-        n = cbor_put_uint(&out[idx], max_len - idx, m->q[i]);
-        if (!n) return 0;
-        idx += n;
-    }
-
-    // "seq": m->seq
-    n = cbor_put_text(&out[idx], max_len - idx, "seq");
-    if (!n) return 0;
-    idx += n;
-    n = cbor_put_uint(&out[idx], max_len - idx, m->seq);
-    if (!n) return 0;
-    idx += n;
-
-    return idx;
-}
-
-static bool cbor_skip_text(const uint8_t *buf, size_t buf_len, size_t *consumed)
-{
-    if (buf_len == 0) return false;
-    uint8_t ib = buf[0];
-    if ((ib & 0xE0) != 0x60) return false; // major type 3 (text)
-
-    uint8_t ai = ib & 0x1F;
-    size_t hdr, len;
-    if (ai <= 23) {
-        hdr = 1;
-        len = ai;
-    } else if (ai == 24) {
-        if (buf_len < 2) return false;
-        hdr = 2;
-        len = buf[1];
-    } else if (ai == 25) {
-        if (buf_len < 3) return false;
-        hdr = 3;
-        len = ((size_t)buf[1] << 8) | buf[2];
-    } else {
-        return false; // kita tidak butuh yang lebih besar
-    }
-    if (hdr + len > buf_len) return false;
-    *consumed = hdr + len;
-    return true;
-}
-
-static bool cbor_read_uint32(const uint8_t *buf, size_t buf_len,
-                             size_t *consumed, uint32_t *out)
-{
-    if (buf_len == 0) return false;
-    uint8_t ib = buf[0];
-    if ((ib & 0xE0) != 0x00) return false; // major type 0 (unsigned int)
-    uint8_t ai = ib & 0x1F;
-
-    if (ai <= 23) {
-        *out = ai;
-        *consumed = 1;
-        return true;
-    } else if (ai == 24) {
-        if (buf_len < 2) return false;
-        *out = buf[1];
-        *consumed = 2;
-        return true;
-    } else if (ai == 25) {
-        if (buf_len < 3) return false;
-        *out = ((uint32_t)buf[1] << 8) | buf[2];
-        *consumed = 3;
-        return true;
-    } else if (ai == 26) {
-        if (buf_len < 5) return false;
-        *out = ((uint32_t)buf[1] << 24) |
-               ((uint32_t)buf[2] << 16) |
-               ((uint32_t)buf[3] << 8)  |
-               buf[4];
-        *consumed = 5;
-        return true;
+        if (!g_err_sd) {
+            g_err_sd = 1;
+            Debug_ErrorJson("SD", "MOUNT_FAIL", "f_mount failed", 1);
+            SendErrorTLV(ERR_MOD_SD, ERR_CODE_MOUNT_FAIL, 1);
+        }
+        snprintf(g_debugBuf, sizeof(g_debugBuf),
+                 "[SD] Mount ERR=%d\r\n", fr);
+        UART_Print(g_debugBuf);
     }
     return false;
 }
 
-static bool cbor_skip_float32(const uint8_t *buf, size_t buf_len, size_t *consumed)
+static bool Log_RecoverTask(void)
 {
-    if (buf_len < 5) return false;
-    if (buf[0] != 0xFA) return false; // simple float32
-    *consumed = 5;
-    return true;
-}
+    static uint8_t done = 0;
+    if (done) return true;
+    if (!g_sd_mounted) return false;
 
-static bool cbor_skip_uint_array(const uint8_t *buf, size_t buf_len,
-                                 uint32_t expected_count, size_t *consumed)
-{
-    if (buf_len == 0) return false;
-    uint8_t ib = buf[0];
-    if ((ib & 0xE0) != 0x80) return false; // major type 4 (array)
-    uint8_t ai = ib & 0x1F;
-    if (ai != expected_count) return false; // kita pakai count fix <= 23
+    FIL file;
+    FRESULT fr;
 
-    size_t idx = 1;
-    for (uint32_t i = 0; i < expected_count; i++) {
-        size_t c; uint32_t dummy;
-        if (!cbor_read_uint32(&buf[idx], buf_len - idx, &c, &dummy)) return false;
-        idx += c;
+    // Pastikan log.json ada
+    fr = f_open(&file, LOG_FILE_NAME, FA_READ | FA_OPEN_EXISTING);
+    if (fr != FR_OK) {
+        // Buat file kosong
+        fr = f_open(&file, LOG_FILE_NAME, FA_WRITE | FA_CREATE_ALWAYS);
+        if (fr != FR_OK) {
+            UART_Print("[LOG] create log.json failed\r\n");
+            return false;
+        }
+        f_close(&file);
+        g_nextSeq = 1;
+        done = 1;
+        return true;
     }
-    *consumed = idx;
+
+    // Scan untuk mencari seq maksimum
+    char line[JSON_LINE_MAX];
+    uint32_t seq;
+    uint32_t maxSeq = 0;
+
+    while (f_gets(line, sizeof(line), &file) != NULL) {
+        if (JSON_ParseSeqFromLine(line, &seq)) {
+            if (seq > maxSeq) maxSeq = seq;
+        }
+    }
+
+    f_close(&file);
+
+    g_nextSeq = (maxSeq == 0) ? 1 : (maxSeq + 1);
+    done = 1;
+
+    snprintf(g_debugBuf, sizeof(g_debugBuf),
+             "[LOG] Recovery done, nextSeq=%lu\r\n", (unsigned long)g_nextSeq);
+    UART_Print(g_debugBuf);
+
     return true;
 }
 
-void App_BackgroundSensors(uint32_t now)
+static bool Log_AppendJSON(const char *jsonLine)
+{
+    FIL f;
+    FRESULT fr = f_open(&f, LOG_FILE_NAME, FA_WRITE | FA_OPEN_APPEND);
+    if (fr != FR_OK) {
+        UART_Print("[LOG] Open failed\r\n");
+        if (!g_err_sd) {
+            g_err_sd = 1;
+            Debug_ErrorJson("SD", "OPEN_FAIL", "open log.json failed", 1);
+            SendErrorTLV(ERR_MOD_SD, ERR_CODE_OPEN_FAIL, 1);
+        }
+        return false;
+    }
+
+    UINT bw;
+    size_t len = strlen(jsonLine);
+    fr = f_write(&f, jsonLine, len, &bw);
+    f_sync(&f);
+    f_close(&f);
+
+    if (fr != FR_OK || bw != len) {
+        UART_Print("[LOG] Write failed\r\n");
+        if (!g_err_sd) {
+            g_err_sd = 1;
+            Debug_ErrorJson("SD", "WRITE_FAIL", "write log.json failed", 1);
+            SendErrorTLV(ERR_MOD_SD, ERR_CODE_WRITE_FAIL, 1);
+        }
+        return false;
+    }
+
+    if (g_err_sd) {
+        g_err_sd = 0;
+        Debug_ErrorJson("SD", "OK", "log.json write OK", 0);
+        SendErrorTLV(ERR_MOD_SD, ERR_CODE_OK, 0);
+    }
+
+    return true;
+}
+
+static bool Log_RemoveSeq(uint32_t seqToRemove)
+{
+    FIL f;
+    FRESULT fr = f_open(&f, LOG_FILE_NAME, FA_READ | FA_WRITE);
+    if (fr != FR_OK) {
+        UART_Print("[LOG] Open for remove failed\r\n");
+        return false;
+    }
+
+    char line[JSON_LINE_MAX];
+    uint32_t seq;
+    UINT bw;
+    DWORD readPos  = 0;
+    DWORD writePos = 0;
+    bool removed   = false;
+
+    while (1) {
+        // Posisikan ke offset baca
+        fr = f_lseek(&f, readPos);
+        if (fr != FR_OK) break;
+
+        // Baca satu baris
+        if (f_gets(line, sizeof(line), &f) == NULL) {
+            // EOF
+            break;
+        }
+
+        // Update posisi baca ke setelah baris ini
+        readPos = f_tell(&f);
+
+        // Ambil seq
+        if (JSON_ParseSeqFromLine(line, &seq) && seq == seqToRemove) {
+            // Skip baris ini (tidak ditulis kembali)
+            removed = true;
+            continue;
+        }
+
+        // Tulis ke posisi writePos
+        fr = f_lseek(&f, writePos);
+        if (fr != FR_OK) break;
+
+        size_t len = strlen(line);
+        fr = f_write(&f, line, len, &bw);
+        if (fr != FR_OK || bw != len) {
+            UART_Print("[LOG] write during remove failed\r\n");
+            break;
+        }
+
+        writePos += bw;
+    }
+
+    // Jika ada baris dihapus, truncate file ke writePos
+    if (removed) {
+        fr = f_lseek(&f, writePos);
+        if (fr == FR_OK) {
+            f_truncate(&f);   // truncate di posisi writePos
+        }
+    }
+
+    f_sync(&f);
+    f_close(&f);
+
+    return removed;
+}
+
+/* ==================== APPLICATION ==================== */
+static void App_BackgroundSensors(uint32_t now)
 {
     static uint8_t  initialized   = 0;
     static uint32_t lastDhtMs     = 0;
@@ -1767,7 +1970,7 @@ void App_BackgroundSensors(uint32_t now)
     if (!initialized)
     {
         uint16_t mask0 = 0;
-        for (int i = 0; i < NUM_INPUTS; i++) {
+        for (uint8_t i = 0; i < NUM_INPUTS; i++) {
             GPIO_PinState s = HAL_GPIO_ReadPin(g_inputs[i].Port, g_inputs[i].Pin);
             if (s == GPIO_PIN_RESET) mask0 |= (1 << i);
         }
@@ -1779,23 +1982,43 @@ void App_BackgroundSensors(uint32_t now)
         initialized       = 1;
     }
 
-    // Update suhu & kelembaban setiap 2s
+    // Update temp/hum every 2s
     if ((now - lastDhtMs) >= 2000U)
     {
         float t_tmp, h_tmp;
-        if (DHT22_Read(&t_tmp, &h_tmp)) {
-            temp = t_tmp;
-            hum  = h_tmp;
+        uint8_t ok = DHT22_Read(&t_tmp, &h_tmp);
+
+        if (ok) {
+            // Baca SUKSES
+            g_temp = t_tmp;
+            g_hum  = h_tmp;
+
+            // Jika sebelumnya error, sekarang recover
+            if (g_err_dht) {
+                g_err_dht = 0;
+                Debug_ErrorJson("DHT", "OK", "DHT22 back online", 0);
+                SendErrorTLV(ERR_MOD_DHT, ERR_CODE_OK, 0);
+            }
+        } else {
+            // Baca GAGAL , tunda pelaporan selama 5 detik
+            if ((now - g_bootMs) >= DHT_ERROR_ENABLE_DELAY_MS) {
+                if (!g_err_dht) {
+                    g_err_dht = 1;
+                    Debug_ErrorJson("DHT", "READ_FAIL", "DHT22 read failed", 1);
+                    SendErrorTLV(ERR_MOD_DHT, ERR_CODE_READ_FAIL, 1);
+                }
+            }
         }
+
         lastDhtMs = now;
     }
 
-    // ADS background (tetap pakai fungsi Anda)
+    // ADS background
     ADS_Task();
 
-    // Baca RAW input
+    // Read RAW inputs
     uint16_t rawMask = 0;
-    for (int i = 0; i < NUM_INPUTS; i++) {
+    for (uint8_t i = 0; i < NUM_INPUTS; i++) {
         GPIO_PinState s = HAL_GPIO_ReadPin(g_inputs[i].Port, g_inputs[i].Pin);
         if (s == GPIO_PIN_RESET) rawMask |= (1 << i);
     }
@@ -1810,10 +2033,10 @@ void App_BackgroundSensors(uint32_t now)
     {
         stableMask        = rawMask;
         g_inputMaskStable = stableMask;
-        g_io_changed_flag = 1;        // trigger acquisition
+        g_io_changed_flag = 1;
     }
 
-    // Terapkan rules (logic output) seperti sebelumnya
+    // Apply rules
     static uint16_t lastAppliedMask = 0xFFFF;
     if (g_inputMaskStable != lastAppliedMask || g_ruleUpdated)
     {
@@ -1828,579 +2051,301 @@ void App_BackgroundSensors(uint32_t now)
     }
 }
 
-static void Acquire_FillMeasurement(Measurement_t *m,
-                                    const DS3231_TimeTypeDef *rtc)
+static void Acquire_FillMeasurement(Measurement_t *m, const DS3231_TimeTypeDef *rtc)
 {
     m->seq = g_nextSeq;
-    m->rtc = *rtc;      // copy struct RTC dari caller
+    m->rtc = *rtc;
 
-    m->temp = temp;
-    m->hum  = hum;
+    m->temp = (int16_t)(g_temp * 10.0f);
+    m->hum  = (int16_t)(g_hum * 10.0f);
 
-    uint16_t mask = g_inputMaskStable;
-    for (int i = 0; i < NUM_INPUTS; i++) {
-        m->dig_in[i] = (mask & (1U << i)) ? 1U : 0U;
+    m->dig_in = g_inputMaskStable;
+
+    for (int i = 0; i < 4; i++) {
+        m->an_in[i] = (uint16_t)g_anCache[i];
     }
 
-    for (int i = 0; i < NUM_ANALOG; i++) {
-        m->an_in[i] = g_anCache[i];
-    }
-
+    m->q = 0;
     for (int i = 0; i < NUM_OUTPUTS; i++) {
-        m->q[i] = (HAL_GPIO_ReadPin(g_outputs[i].Port, g_outputs[i].Pin) == GPIO_PIN_SET) ? 1U : 0U;
+        if (HAL_GPIO_ReadPin(g_outputs[i].Port, g_outputs[i].Pin) == GPIO_PIN_SET) {
+            m->q |= (1U << i);
+        }
     }
 }
 
-void App_HandleAcquisition(uint32_t now)
+static void App_HandleAcquisition(uint32_t now)
 {
-    // ===== STATE VARIABLES =====
-    static uint32_t lastLogRtcEpoch   = 0;   // Epoch RTC terakhir saat log
-    static uint32_t lastRtcCheckTick  = 0;   // Tick terakhir saat RTC dibaca
-    static uint32_t lastRtcEpochValue = 0;   // Nilai epoch RTC terakhir (untuk deteksi stuck)
-    static uint8_t  rtcStuckCount     = 0;   // Counter jika RTC tidak berubah
-    static uint8_t  firstRun          = 1;   // Flag log pertama
+    static uint32_t lastLogTick      = 0;
+    static uint8_t  startupDelayDone = 0;
+    static uint32_t startupStartMs   = 0;
 
     bool needLog = false;
     bool byIo    = false;
 
-    if (!g_sd_mounted)
-        return;
+    if (!g_sd_mounted) return;
 
-    // ===== 1) TRIGGER: I/O CHANGE =====
+    if (!startupDelayDone) {
+        if (startupStartMs == 0) {
+            startupStartMs = now;   // simpan waktu mulai
+        }
+
+        if ((now - startupStartMs) < STARTUP_DELAY_MS) {
+            // Masih dalam jeda, abaikan event IO dan jangan log/kirim
+            g_io_changed_flag = 0;
+            return;
+        }
+
+        // Jeda selesai → mulai siklus normal
+        startupDelayDone = 1;
+        lastLogTick      = now;    // reset timer periodik
+    }
+
+    // 1) Trigger: I/O change
     if (g_io_changed_flag) {
         g_io_changed_flag = 0;
         needLog = true;
         byIo    = true;
     }
 
-    // ===== 2) BACA RTC =====
+    // 2) Periodic (setiap DELIVERY_TIME_INTERVAL, misal 60 detik)
+    if (!needLog && (now - lastLogTick) >= DELIVERY_TIME_INTERVAL) {
+        needLog = true;
+        byIo    = false;
+    }
+
+    if (!needLog) return;
+    lastLogTick = now;
+
+    // 3) Read RTC
     DS3231_TimeTypeDef rtc;
-    uint8_t rtcOk = DS3231_ReadTime(&rtc);
-
-    if (!rtcOk) {
-        // RTC gagal dibaca - gunakan fallback HAL_GetTick
-        UART_Print("[ACQ] RTC read failed!\r\n");
-
-        // Fallback: log setiap 60 detik berdasarkan HAL_GetTick
-        if (!needLog && (now - lastRtcCheckTick) >= DELIVERY_TIME_INTERVAL) {
-            needLog = true;
-            byIo    = false;
-            lastRtcCheckTick = now;
+    if (!DS3231_ReadTime(&rtc)) {
+        if (!g_err_rtc) {
+            g_err_rtc = 1;
+            Debug_ErrorJson("RTC", "READ_FAIL", "DS3231 read failed", 1);
+            SendErrorTLV(ERR_MOD_RTC, ERR_CODE_READ_FAIL, 1);
         }
-
-        // Isi RTC dengan dummy untuk timestamp
         memset(&rtc, 0, sizeof(rtc));
         rtc.year  = 2000;
         rtc.month = 1;
         rtc.day   = 1;
-    }
-    else
-    {
-        // RTC OK - hitung epoch
-        uint32_t nowEpoch = RTC_ToEpochSeconds(&rtc);
-
-        // ===== 3) DETEKSI RTC STUCK =====
-        // Cek apakah RTC berubah dalam 2 detik terakhir
-        if ((now - lastRtcCheckTick) >= 2000) {
-            if (nowEpoch == lastRtcEpochValue) {
-                rtcStuckCount++;
-                if (rtcStuckCount >= 3) {
-                    UART_Print("[ACQ] WARN: RTC stuck!\r\n");
-                }
-            } else {
-                rtcStuckCount = 0;  // Reset counter
-            }
-            lastRtcEpochValue = nowEpoch;
-            lastRtcCheckTick  = now;
-        }
-
-        // ===== 4) TRIGGER: FIRST RUN =====
-        if (firstRun) {
-            needLog         = true;
-            byIo            = false;
-            firstRun        = 0;
-            lastLogRtcEpoch = nowEpoch;
-        }
-
-        // ===== 5) TRIGGER: INTERVAL 60 DETIK (RTC-BASED) =====
-        if (!needLog) {
-            // Jika RTC stuck, gunakan HAL_GetTick sebagai fallback
-            if (rtcStuckCount >= 3) {
-                // Fallback ke HAL_GetTick
-                static uint32_t fallbackTick = 0;
-                if (fallbackTick == 0) fallbackTick = now;
-
-                if ((now - fallbackTick) >= DELIVERY_TIME_INTERVAL) {
-                    needLog = true;
-                    byIo    = false;
-                    fallbackTick = now;
-                }
-            }
-            else {
-                // Normal: gunakan RTC epoch
-                if ((nowEpoch - lastLogRtcEpoch) >= 60U) {
-                    needLog = true;
-                    byIo    = false;
-                }
-            }
-        }
-
-        // Update last epoch jika akan log
-        if (needLog) {
-            lastLogRtcEpoch = nowEpoch;
+    } else {
+        if (g_err_rtc) {
+            g_err_rtc = 0;
+            Debug_ErrorJson("RTC", "READ_OK", "DS3231 back online", 0);
+            SendErrorTLV(ERR_MOD_RTC, ERR_CODE_OK, 0);
         }
     }
 
-    // ===== 6) TIDAK PERLU LOG? RETURN =====
-    if (!needLog)
-        return;
-
-    // ===== 7) BUAT MEASUREMENT =====
+    // 4) Fill measurement
     Measurement_t m;
     Acquire_FillMeasurement(&m, &rtc);
 
-    // ===== 8) ENCODE CBOR =====
-    uint8_t cbor[256];
-    size_t cbor_len = CBOR_EncodeMeasurement(&m, cbor, sizeof(cbor));
-    if (cbor_len == 0) {
-        UART_Print("[ACQ] CBOR encode failed\r\n");
+    // 5) Encode to JSON for SD card
+    char jsonLine[JSON_LINE_MAX];
+    size_t jsonLen = JSON_EncodeMeasurement(&m, jsonLine, sizeof(jsonLine));
+    if (jsonLen == 0) {
+        UART_Print("[ACQ] JSON encode failed\r\n");
         return;
     }
 
-    // ===== 9) SIMPAN KE LOG FILE =====
-    if (Log_AppendRecord(cbor, cbor_len)) {
-        g_nextSeq++;
+    // 6) Simpan ke log.json
+    if (Log_AppendJSON(jsonLine)) {
         Debug_PrintMeasurementJSON(&m, byIo);
+
+        // 7) Kirim TLV measurement ke ESP
+        if (!SendMeasurementTLV(&m)) {
+            UART_Print("[ACQ] TLV send failed (data tetap di log)\r\n");
+        }
+
+        // Seq berikutnya
+        g_nextSeq++;
     } else {
-        UART_Print("[ACQ] Log append failed!\r\n");
+        UART_Print("[ACQ] Log append failed\r\n");
     }
 }
 
-void Log_InitRuntime(void)
+static void App_HandleAck(void)
 {
-    g_sd_mounted = 0;
-    g_nextSeq    = 1;
+    if (!g_sd_mounted) return;
+    if (!g_ack_pending) return;
+
+    uint32_t seq = g_ack_seq;
+    g_ack_pending = 0;
+
+    bool removed = Log_RemoveSeq(seq);
+
+    snprintf(g_debugBuf, sizeof(g_debugBuf),
+             "[ACK] seq=%lu, removed_from_log=%s\r\n",
+             (unsigned long)seq, removed ? "YES" : "NO");
+    UART_Print(g_debugBuf);
+}
+/* ==================== DEBUG ==================== */
+static void Debug_ErrorJson(const char* module, const char* code, const char* msg, uint8_t active)
+{
+    // active: 1 = error terjadi, 0 = recovery
+    snprintf(g_debugBuf, sizeof(g_debugBuf),
+             "[ERR]{\"type\":\"error\",\"module\":\"%s\","
+             "\"code\":\"%s\",\"active\":%u,\"msg\":\"%s\"}\r\n",
+             module, code, active, msg);
+    UART_Print(g_debugBuf);
 }
 
-bool SD_MountTask(void)
+static void Debug_PrintMeasurementJSON(const Measurement_t *m, bool byIo)
 {
-    if (g_sd_mounted) return true;
-
-    FRESULT fr = f_mount(&USERFatFS, (TCHAR const*)USERPath, 1);
-    if (fr == FR_OK) {
-        g_sd_mounted = 1;
-        UART_Print("SD_MountTask: mounted OK\r\n");
-        return true;
-    } else {
-        char msg[32];
-        sprintf(msg, "SD_MountTask: mount ERR=%d\r\n", fr);
-        UART_Print(msg);
-    }
-    return false;
-}
-
-bool Log_RecoverTask(void)
-{
-    static uint8_t done = 0;
-    if (done) return true;
-    if (!g_sd_mounted) return false;
-
-    FIL file;
-    FILINFO fi;
-    FRESULT fr;
-
-    // 1) Tangani log.new vs log.cbor
-    int log_exists  = (f_stat(LOG_FILE_NAME, &fi) == FR_OK);
-    int temp_exists = (f_stat("log.new", &fi) == FR_OK);
-
-    if (!log_exists && temp_exists) {
-        f_rename("log.new", LOG_FILE_NAME);
-        log_exists = 1;
-    } else if (log_exists && temp_exists) {
-        f_unlink("log.new");
-    }
-
-    if (!log_exists) {
-        fr = f_open(&file, LOG_FILE_NAME, FA_WRITE | FA_CREATE_ALWAYS);
-        if (fr == FR_OK) f_close(&file);
-    }
-
-    // pastikan error.cbor ada
-    if (f_stat(ERROR_FILE_NAME, &fi) != FR_OK) {
-        fr = f_open(&file, ERROR_FILE_NAME, FA_WRITE | FA_CREATE_ALWAYS);
-        if (fr == FR_OK) f_close(&file);
-    }
-
-    // 2) Scan log.cbor untuk cari max seq
-    fr = f_open(&file, LOG_FILE_NAME, FA_READ);
-    if (fr != FR_OK) {
-        g_nextSeq = 1;
-        done = 1;
-        return true;
-    }
-
-    uint8_t  buf[256];
-    uint16_t len;
-    uint32_t seq;
-    uint32_t max_seq = 0;
-
-    while (Log_ReadNextRecordFromFile(&file, &seq, buf, &len)) {
-        if (seq > max_seq) max_seq = seq;
-    }
-
-    f_close(&file);
-
-    g_nextSeq = (max_seq == 0) ? 1 : (max_seq + 1);
-
-    done = 1;
-    UART_Print("Log_RecoverTask: done, nextSeq=");
-    char msg[32];
-    sprintf(msg, "%lu\r\n", (unsigned long)g_nextSeq);
-    UART_Print(msg);
-    return true;
-}
-
-bool Log_AppendRecord(const uint8_t *cbor, size_t len)
-{
-    FIL f;
-    FRESULT fr = f_open(&f, LOG_FILE_NAME, FA_WRITE | FA_OPEN_APPEND);
-    if (fr != FR_OK) return false;
-
-    UINT bw;
-    fr = f_write(&f, cbor, len, &bw);
-    f_sync(&f);
-    f_close(&f);
-
-    return (fr == FR_OK && bw == len);
-}
-
-bool Log_AppendErrorRecord(const uint8_t *cbor, size_t len)
-{
-    FIL f;
-    FRESULT fr = f_open(&f, ERROR_FILE_NAME, FA_WRITE | FA_OPEN_APPEND);
-    if (fr != FR_OK) return false;
-
-    UINT bw;
-    fr = f_write(&f, cbor, len, &bw);
-    f_sync(&f);
-    f_close(&f);
-
-    return (fr == FR_OK && bw == len);
-}
-
-bool Log_ReadHeadRecord(uint32_t *out_seq,
-                        uint8_t *out_cbor,
-                        uint16_t *out_len)
-{
-    FIL f;
-    FRESULT fr = f_open(&f, LOG_FILE_NAME, FA_READ);
-    if (fr != FR_OK) return false;
-
-    f_lseek(&f, 0);
-    bool ok = Log_ReadNextRecordFromFile(&f, out_seq, out_cbor, out_len);
-    f_close(&f);
-    return ok;
-}
-
-bool Log_TruncateUpToSeq(uint32_t upto_seq)
-{
-    FIL f_in, f_out;
-    FRESULT fr;
-
-    fr = f_open(&f_in, LOG_FILE_NAME, FA_READ);
-    if (fr != FR_OK) return false;
-
-    fr = f_open(&f_out, "log.new", FA_WRITE | FA_CREATE_ALWAYS);
-    if (fr != FR_OK) {
-        f_close(&f_in);
-        return false;
-    }
-
-    uint8_t  buf[256];
-    uint16_t len;
-    uint32_t seq;
-
-    while (Log_ReadNextRecordFromFile(&f_in, &seq, buf, &len)) {
-        if (seq > upto_seq) {
-            UINT bw;
-            fr = f_write(&f_out, buf, len, &bw);
-            if (fr != FR_OK || bw != len) {
-                f_close(&f_in);
-                f_close(&f_out);
-                f_unlink("log.new");
-                return false;
-            }
-        }
-    }
-
-    f_sync(&f_out);
-    f_close(&f_in);
-    f_close(&f_out);
-
-    f_unlink(LOG_FILE_NAME);
-    fr = f_rename("log.new", LOG_FILE_NAME);
-    if (fr != FR_OK) {
-        // recovery: di boot berikutnya Log_RecoverTask akan deteksi log.new
-        return false;
-    }
-
-    return true;
-}
-
-bool Log_ReadNextRecordFromFile(FIL *pf, uint32_t *out_seq,
-                                uint8_t *out_cbor, uint16_t *out_len)
-{
-    UINT   br;
-    uint8_t tmp[256];
-    DWORD  pos = f_tell(pf);
-
-    FRESULT fr = f_read(pf, tmp, sizeof(tmp), &br);
-    if (fr != FR_OK || br == 0) {
-        return false; // EOF atau error
-    }
-
-    size_t idx = 0;
-    if (tmp[0] != 0xA6) {   // map(6)
-        return false;
-    }
-    idx = 1;
-
-    uint32_t seq_val = 0;
-
-    for (int pair = 0; pair < 6; pair++) {
-        // --- parse key (text) ---
-        if (idx >= br) return false;
-        uint8_t key_hdr = tmp[idx];
-        if ((key_hdr & 0xE0) != 0x60) return false; // bukan text
-        uint8_t key_len = key_hdr & 0x1F;
-        if (key_len > (br - idx - 1)) return false;
-        idx++;
-        const uint8_t *key_ptr = &tmp[idx];
-        idx += key_len;
-
-        const uint8_t *val_ptr = &tmp[idx];
-        size_t val_len = br - idx;
-        size_t c;
-
-        // --- cek nama key & skip value sesuai tipe ---
-        if (key_len == 9 && memcmp(key_ptr, "timestamp", 9) == 0) {
-            if (!cbor_skip_text(val_ptr, val_len, &c)) return false;
-            idx += c;
-
-        } else if (key_len == 3 && memcmp(key_ptr, "env", 3) == 0) {
-            // env: map(2) { "temp": float32, "hum": float32 }
-            if (val_len == 0 || val_ptr[0] != 0xA2) return false;
-            size_t j = 1;
-
-            if (!cbor_skip_text(&val_ptr[j], val_len - j, &c)) return false; // "temp"
-            j += c;
-            if (!cbor_skip_float32(&val_ptr[j], val_len - j, &c)) return false;
-            j += c;
-
-            if (!cbor_skip_text(&val_ptr[j], val_len - j, &c)) return false; // "hum"
-            j += c;
-            if (!cbor_skip_float32(&val_ptr[j], val_len - j, &c)) return false;
-            j += c;
-
-            idx += j;
-
-        } else if (key_len == 6 && memcmp(key_ptr, "dig_in", 6) == 0) {
-            if (!cbor_skip_uint_array(val_ptr, val_len, NUM_INPUTS, &c)) return false;
-            idx += c;
-
-        } else if (key_len == 5 && memcmp(key_ptr, "an_in", 5) == 0) {
-            if (!cbor_skip_uint_array(val_ptr, val_len, NUM_ANALOG, &c)) return false;
-            idx += c;
-
-        } else if (key_len == 1 && memcmp(key_ptr, "q", 1) == 0) {
-            if (!cbor_skip_uint_array(val_ptr, val_len, NUM_OUTPUTS, &c)) return false;
-            idx += c;
-
-        } else if (key_len == 3 && memcmp(key_ptr, "seq", 3) == 0) {
-            if (!cbor_read_uint32(val_ptr, val_len, &c, &seq_val)) return false;
-            idx += c;
-
-        } else {
-            return false; // key tak dikenal
-        }
-    }
-
-    if (idx > br) return false;
-
-    memcpy(out_cbor, tmp, idx);
-    *out_len = (uint16_t)idx;
-    *out_seq = seq_val;
-
-    // majukan file pointer ke awal record berikutnya
-    f_lseek(pf, pos + idx);
-    return true;
-}
-
-void Tx_InitRuntime(TxContext_t *ctx)
-{
-    memset(ctx, 0, sizeof(*ctx));
-}
-
-bool Tx_StartFrameSend(TxContext_t *ctx)
-{
-    if (!g_uart2_tx_done) return false;
-
-    uint16_t idx = 0;
-    g_uart2_tx_buf[idx++] = SOF_BYTE;
-    g_uart2_tx_buf[idx++] = 0x01;       // TYPE = data
-    g_uart2_tx_buf[idx++] = 0x10;       // CMD
-
-    uint16_t len = ctx->cbor_len;
-    g_uart2_tx_buf[idx++] = (len >> 8) & 0xFF;
-    g_uart2_tx_buf[idx++] = (len & 0xFF);
-
-    memcpy(&g_uart2_tx_buf[idx], ctx->cbor_buf, len);
-    idx += len;
-
-    uint16_t crc = CRC16_Modbus(g_uart2_tx_buf, idx);
-    g_uart2_tx_buf[idx++] = (crc >> 8) & 0xFF;
-    g_uart2_tx_buf[idx++] = crc & 0xFF;
-
-    g_uart2_tx_len  = idx;
-    g_uart2_tx_done = 0;
-
-    if (HAL_UART_Transmit_IT(&huart2, g_uart2_tx_buf, g_uart2_tx_len) != HAL_OK) {
-        g_uart2_tx_done = 1;
-        return false;
-    }
-    return true;
-}
-
-void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
-{
-    if (huart == &huart2) {
-        g_uart2_tx_done = 1;
-    }
-}
-
-void Tx_StateMachine_Run(TxState_t *state, TxContext_t *ctx, uint32_t now)
-{
-    switch (*state)
-    {
-    case TX_STATE_IDLE:
-        if (!g_sd_mounted) break;
-
-        if (Log_ReadHeadRecord(&ctx->seq, ctx->cbor_buf, &ctx->cbor_len)) {
-            ctx->retry_count = 0;
-            *state = TX_STATE_SEND_FRAME;
-        }
-        break;
-
-    case TX_STATE_SEND_FRAME:
-        if (Tx_StartFrameSend(ctx)) {
-            ctx->ack_deadline_ms = now + ACK_TIMEOUT_MS;
-            *state = TX_STATE_WAIT_TX_COMPLETE;
-        }
-        break;
-
-    case TX_STATE_WAIT_TX_COMPLETE:
-        if (g_uart2_tx_done) {
-            *state = TX_STATE_WAIT_ACK;
-        }
-        break;
-
-    case TX_STATE_WAIT_ACK:
-        if (g_ack_pending) {
-            uint32_t ack_seq = g_ack_seq;
-            g_ack_pending = 0;
-
-            if (ack_seq == ctx->seq) {
-                *state = TX_STATE_ACK_OK;
-            } else if (ack_seq < ctx->seq) {
-                // ack lama, abaikan
-            } else {
-                // aneh, treat sebagai NACK
-                *state = TX_STATE_RETRY_OR_FAIL;
-            }
-        } else if ((int32_t)(now - ctx->ack_deadline_ms) >= 0) {
-            *state = TX_STATE_RETRY_OR_FAIL;
-        }
-        break;
-
-    case TX_STATE_ACK_OK:
-        if (Log_TruncateUpToSeq(ctx->seq)) {
-            *state = TX_STATE_IDLE;
-        }
-        break;
-
-    case TX_STATE_RETRY_OR_FAIL:
-        ctx->retry_count++;
-        if (ctx->retry_count <= TX_MAX_RETRY) {
-            *state = TX_STATE_SEND_FRAME;
-        } else {
-            *state = TX_STATE_MOVE_TO_ERROR;
-        }
-        break;
-
-    case TX_STATE_MOVE_TO_ERROR:
-        if (Log_AppendErrorRecord(ctx->cbor_buf, ctx->cbor_len)) {
-            if (Log_TruncateUpToSeq(ctx->seq)) {
-                *state = TX_STATE_IDLE;
-            }
-        }
-        break;
-
-    default:
-        *state = TX_STATE_IDLE;
-        break;
-    }
-}
-
-static void Debug_PrintMeasurementJSON(const Measurement_t *m, bool trigByIo)
-{
-    char line[320];
     char ts[32];
-    char dinStr[64];
+    char digArr[64];
+    char anArr[32];
+    char qArr[24];
     char *p;
-    int  rem;
+    int n;
 
-    // Timestamp ISO8601 dengan Z
+    // Build timestamp
     snprintf(ts, sizeof(ts), "%04u-%02u-%02uT%02u:%02u:%02uZ",
              m->rtc.year, m->rtc.month, m->rtc.day,
              m->rtc.hours, m->rtc.minutes, m->rtc.seconds);
 
-    // Build JSON array untuk dig_in
-    p   = dinStr;
-    rem = sizeof(dinStr);
-    *p++ = '['; rem--;
-    for (int i = 0; i < NUM_INPUTS; i++) {
-        int n = snprintf(p, rem, "%u%s",
-                         m->dig_in[i],
-                         (i < NUM_INPUTS - 1) ? "," : "");
-        if (n < 0 || n >= rem) break;
-        p   += n;
-        rem -= n;
+    // Build dig_in array
+    p = digArr;
+    *p++ = '[';
+    for (uint8_t i = 0; i < NUM_INPUTS; i++) {
+        uint8_t bit = (m->dig_in & (1U << i)) ? 1 : 0;
+        n = snprintf(p, sizeof(digArr) - (p - digArr), "%u%s",
+                     bit, (i < NUM_INPUTS - 1) ? "," : "");
+        if (n > 0) p += n;
     }
     *p++ = ']';
-    *p   = '\0';
+    *p = '\0';
 
-    // Prefix: [ACQ][IO] atau [ACQ][TMR]
-    const char *src = trigByIo ? "[ACQ][IO] " : "[ACQ][TMR] ";
+    // Build an_in array
+    snprintf(anArr, sizeof(anArr), "[%u,%u,%u,%u]",
+             m->an_in[0], m->an_in[1], m->an_in[2], m->an_in[3]);
 
-    int len = snprintf(line, sizeof(line),
-        "%s"
-        "{\"timestamp\":\"%s\","
-        "\"env\":{\"temp\":%.1f,\"hum\":%.1f},"
-        "\"dig_in\":%s,"
-        "\"an_in\":[%u,%u,%u,%u],"
-        "\"q\":[%u,%u,%u,%u],"
-        "\"seq\":%lu}\r\n",
-        src,
-        ts,
-        m->temp, m->hum,
-        dinStr,
-        m->an_in[0], m->an_in[1], m->an_in[2], m->an_in[3],
-        m->q[0], m->q[1], m->q[2], m->q[3],
+    // Build q array
+    p = qArr;
+    *p++ = '[';
+    for (uint8_t i = 0; i < NUM_OUTPUTS; i++) {
+        uint8_t bit = (m->q & (1U << i)) ? 1 : 0;
+        n = snprintf(p, sizeof(qArr) - (p - qArr), "%u%s",
+                     bit, (i < NUM_OUTPUTS - 1) ? "," : "");
+        if (n > 0) p += n;
+    }
+    *p++ = ']';
+    *p = '\0';
+
+    const char *src = byIo ? "[ACQ][IO] " : "[ACQ][TMR] ";
+
+    snprintf(g_debugBuf, sizeof(g_debugBuf),
+        "%s{\"timestamp\":\"%s\",\"env\":{\"temp\":%.1f,\"hum\":%.1f},"
+        "\"dig_in\":%s,\"an_in\":%s,\"q\":%s,\"seq\":%lu}\r\n",
+        src, ts,
+        m->temp / 10.0f, m->hum / 10.0f,
+        digArr, anArr, qArr,
         (unsigned long)m->seq
     );
 
-    if (len > 0 && len < (int)sizeof(line)) {
-        UART_Print(line);    // kirim ke UART1
+    UART_Print(g_debugBuf);
+}
+
+/* ==================== TLV DEBUG DUMP ==================== */
+static void Debug_DumpTLV(const char *prefix, const uint8_t *tlv, size_t len)
+{
+    size_t i = 0;
+
+    snprintf(g_debugBuf, sizeof(g_debugBuf),
+             "%s TLV dump, len=%u\r\n", prefix, (unsigned)len);
+    UART_Print(g_debugBuf);
+
+    while (i + 2 <= len)
+    {
+        uint8_t tag = tlv[i];
+        uint8_t l   = tlv[i + 1];
+        i += 2;
+
+        if (i + l > len) {
+            snprintf(g_debugBuf, sizeof(g_debugBuf),
+                     "%s  !! malformed TLV (tag=0x%02X, len=%u, remaining=%u)\r\n",
+                     prefix, tag, l, (unsigned)(len - (i - 2)));
+            UART_Print(g_debugBuf);
+            break;
+        }
+
+        int n = snprintf(g_debugBuf, sizeof(g_debugBuf),
+                         "%s  tag=0x%02X len=%u val=", prefix, tag, l);
+        for (uint8_t j = 0; j < l && n < (int)sizeof(g_debugBuf) - 3; j++) {
+            n += snprintf(g_debugBuf + n, sizeof(g_debugBuf) - n,
+                          "%02X ", tlv[i + j]);
+        }
+        snprintf(g_debugBuf + n, sizeof(g_debugBuf) - n, "\r\n");
+        UART_Print(g_debugBuf);
+
+        /* Interpretasi tag yang dikenal */
+        if (tag == TLV_TAG_SEQ && l == 4) {
+            uint32_t seq = TLV_ReadU32BE(&tlv[i]);
+            snprintf(g_debugBuf, sizeof(g_debugBuf),
+                     "%s    -> SEQ = %lu\r\n",
+                     prefix, (unsigned long)seq);
+            UART_Print(g_debugBuf);
+        }
+        else if (tag == TLV_TAG_TIMESTAMP && l == 4) {
+            uint32_t ts = TLV_ReadU32BE(&tlv[i]);
+            snprintf(g_debugBuf, sizeof(g_debugBuf),
+                     "%s    -> TIMESTAMP = %lu (epoch)\r\n",
+                     prefix, (unsigned long)ts);
+            UART_Print(g_debugBuf);
+        }
+        else if (tag == TLV_TAG_TEMP && l == 2) {
+            int16_t t = (int16_t)(((uint16_t)tlv[i] << 8) | tlv[i + 1]);
+            snprintf(g_debugBuf, sizeof(g_debugBuf),
+                     "%s    -> TEMP = %.1f C\r\n",
+                     prefix, t / 10.0f);
+            UART_Print(g_debugBuf);
+        }
+        else if (tag == TLV_TAG_HUM && l == 2) {
+            int16_t h = (int16_t)(((uint16_t)tlv[i] << 8) | tlv[i + 1]);
+            snprintf(g_debugBuf, sizeof(g_debugBuf),
+                     "%s    -> HUM  = %.1f %%\r\n",
+                     prefix, h / 10.0f);
+            UART_Print(g_debugBuf);
+        }
+        else if (tag == TLV_TAG_DIG_IN && l == 2) {
+            uint16_t dig = ((uint16_t)tlv[i] << 8) | tlv[i + 1];
+            snprintf(g_debugBuf, sizeof(g_debugBuf),
+                     "%s    -> DIG_IN mask = 0x%04X\r\n",
+                     prefix, dig);
+            UART_Print(g_debugBuf);
+        }
+        else if (tag == TLV_TAG_AN_IN && l == 8) {
+            uint16_t an[4];
+            for (int ch = 0; ch < 4; ch++) {
+                an[ch] = ((uint16_t)tlv[i + ch*2] << 8) | tlv[i + ch*2 + 1];
+            }
+            snprintf(g_debugBuf, sizeof(g_debugBuf),
+                     "%s    -> AN_IN = [%u,%u,%u,%u]\r\n",
+                     prefix, an[0], an[1], an[2], an[3]);
+            UART_Print(g_debugBuf);
+        }
+        else if (tag == TLV_TAG_Q && l == 1) {
+            uint8_t q = tlv[i];
+            snprintf(g_debugBuf, sizeof(g_debugBuf),
+                     "%s    -> Q mask = 0x%02X\r\n",
+                     prefix, q);
+            UART_Print(g_debugBuf);
+        }
+        else if (tag == TAG_RULE) {   // dari ESP32
+            snprintf(g_debugBuf, sizeof(g_debugBuf),
+                     "%s    -> RULE string: \"%.*s\"\r\n",
+                     prefix, l, (const char *)&tlv[i]);
+            UART_Print(g_debugBuf);
+        }
+        else if (tag == TAG_RTC_TS && l == 4) {
+            uint32_t epoch = TLV_ReadU32BE(&tlv[i]);
+            snprintf(g_debugBuf, sizeof(g_debugBuf),
+                     "%s    -> RTC EPOCH = %lu\r\n",
+                     prefix, (unsigned long)epoch);
+            UART_Print(g_debugBuf);
+        }
+
+        i += l;
     }
 }
 
