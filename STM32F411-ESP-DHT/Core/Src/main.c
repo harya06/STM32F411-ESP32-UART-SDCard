@@ -159,22 +159,24 @@ typedef enum {
 
 /* ADS1115 */
 #define ADS_FS_VOLT         4.096f
+#define ADC_INPUT_MAX_VOLT  3.3f
 #define ADS_READ_PERIOD_MS  100U
 
-/* Error module IDs */
-#define ERR_MOD_RTC   1
-#define ERR_MOD_DHT   2
-#define ERR_MOD_ADS   3
-#define ERR_MOD_SD    4
+/* mid: module id */
+#define MOD_RTC   1
+#define MOD_DHT   2
+#define MOD_ADS   3
+#define MOD_SD    4
 
-/* Generic error codes */
-#define ERR_CODE_OK          0
-#define ERR_CODE_READ_FAIL   1
-#define ERR_CODE_I2C_TX_FAIL 2
-#define ERR_CODE_I2C_RX_FAIL 3
-#define ERR_CODE_MOUNT_FAIL  4
-#define ERR_CODE_OPEN_FAIL   5
-#define ERR_CODE_WRITE_FAIL  6
+/* st: status */
+#define ST_OK     0
+#define ST_ERR    1
+
+/* ec: error code */
+#define ERR_NONE      0
+#define ERR_TIMEOUT   1
+#define ERR_NOT_FOUND 2
+#define ERR_CRC       3
 
 /* Buffers */
 #define RX_BUF_SIZE             256U
@@ -187,11 +189,11 @@ typedef enum {
 #define TX_MAX_RETRY            3U
 #define ACK_TIMEOUT_MS          2000U
 
-/* Startup delay before first log/send */
-#define STARTUP_DELAY_MS        10000U
-
 /* DHT error reporting delay */
 #define DHT_ERROR_ENABLE_DELAY_MS   5000U   // 5 detik setelah boot
+
+/* SD status monitor*/
+#define SD_STATUS_INTERVAL_MS   8000U
 
 /* Rules */
 #define RULE_MAX_PAYLOAD        240U
@@ -199,6 +201,7 @@ typedef enum {
 
 /* File names*/
 #define LOG_FILE_NAME           "log.json"
+#define STATUS_FILE_NAME        "status.json"
 
 /* USER CODE END PD */
 
@@ -341,16 +344,14 @@ static size_t TLV_PutI16(uint8_t *buf, uint8_t tag, int16_t val);
 static size_t TLV_PutU32(uint8_t *buf, uint8_t tag, uint32_t val);
 static size_t TLV_PutU16Array4(uint8_t *buf, uint8_t tag, const uint16_t arr[4]);
 static size_t TLV_EncodeMeasurement(const Measurement_t *m, uint8_t *out, size_t maxLen);
-static void SendErrorTLV(uint8_t moduleId, uint8_t code, uint8_t active);
+static void SendErrorTLV(uint8_t mid, uint8_t st, uint8_t ec);
 
 /* TLV Parser (from ESP32) */
-static uint16_t TLV_ReadU16BE(const uint8_t *p);
 static uint32_t TLV_ReadU32BE(const uint8_t *p);
 
 /* JSON Encoder/Parser (for SD Card log & debug) */
 static size_t JSON_EncodeMeasurement(const Measurement_t *m, char *out, size_t maxLen);
 static bool JSON_ParseSeqFromLine(const char *line, uint32_t *outSeq);
-static bool JSON_ParseToMeasurement(const char *json, Measurement_t *m);
 
 /* Rules & Frame RX */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart);
@@ -374,6 +375,7 @@ static void Log_InitRuntime(void);
 static bool SD_MountTask(void);
 static bool Log_RecoverTask(void);
 static bool Log_AppendJSON(const char *jsonLine);
+static void SD_StatusTask(uint32_t now);
 
 /* Application */
 static void App_BackgroundSensors(uint32_t now);
@@ -381,7 +383,7 @@ static void App_HandleAcquisition(uint32_t now);
 static void Acquire_FillMeasurement(Measurement_t *m, const DS3231_TimeTypeDef *rtc);
 
 /* Debug */
-static void Debug_ErrorJson(const char* module, const char* code, const char* msg, uint8_t active);
+static void Debug_ErrorJson(uint8_t mid, uint8_t st, uint8_t ec);
 static void Debug_PrintMeasurementJSON(const Measurement_t *m, bool byIo);
 static void Debug_DumpTLV(const char *prefix, const uint8_t *tlv, size_t len);
 
@@ -454,37 +456,50 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  uint32_t now = HAL_GetTick();
+      uint32_t now = HAL_GetTick();
 
-	  switch (g_appState)
-	  {
-	  case APP_STATE_SD_MOUNT:
-		  if (SD_MountTask()) {
-			  g_appState = APP_STATE_LOG_RECOVER;
-	      } else {
-	          HAL_Delay(1000); // Retry delay
-	      }
-	      break;
+      switch (g_appState)
+      {
+      case APP_STATE_SD_MOUNT:
+          {
+              uint8_t tries = 0;
+              while (!g_sd_mounted && tries < 3) {
+                  SD_MountTask();
+                  HAL_Delay(200); // jeda 200ms antar percobaan awal
+                  tries++;
+              }
+              g_appState = APP_STATE_LOG_RECOVER;
+          }
+          break;
 
-	  case APP_STATE_LOG_RECOVER:
-		  if (Log_RecoverTask()) {
-	    	  g_appState = APP_STATE_RUN;
-	          UART_Print("[APP] Entering RUN state\r\n");
-		  }
-		  break;
+      case APP_STATE_LOG_RECOVER:
+          // Kalau SD sudah ter-mount, lakukan recovery; kalau tidak, skip saja
+          if (g_sd_mounted) {
+              Log_RecoverTask();
+          }
+          g_appState = APP_STATE_RUN;
+          UART_Print("[APP] Entering RUN state\r\n");
+          break;
 
-	  case APP_STATE_RUN:
-	      App_BackgroundSensors(now);
-	      App_HandleAcquisition(now);
-	      App_HandleAck();
-	      break;
+      case APP_STATE_RUN:
+          // Di RUN, kalau belum ada SD, coba mount berkala (user colok saat jalan)
+          if (!g_sd_mounted) {
+              SD_MountTask();
+          }
 
-	  default:
-	      g_appState = APP_STATE_SD_MOUNT;
-	      break;
-	  }
+          App_BackgroundSensors(now);
+          App_HandleAcquisition(now);
+          App_HandleAck();
+          SD_StatusTask(now);
 
-	  HAL_Delay(1);
+          break;
+
+      default:
+          g_appState = APP_STATE_SD_MOUNT;
+          break;
+      }
+
+      HAL_Delay(1);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -732,7 +747,10 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, SUHU_SENSOR_Pin|SD_CS_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(SUHU_SENSOR_GPIO_Port, SUHU_SENSOR_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(SD_CS_GPIO_Port, SD_CS_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, OUTPUT_4_Pin|OUTPUT_3_Pin|OUTPUT_2_Pin|OUTPUT_1_Pin, GPIO_PIN_RESET);
@@ -854,11 +872,32 @@ uint8_t DHT_Start(void)
 uint8_t DHT_ReadBit(void)
 {
     uint8_t bit = 0;
-    while (HAL_GPIO_ReadPin(SUHU_SENSOR_GPIO_Port, SUHU_SENSOR_Pin) == GPIO_PIN_RESET);
+    uint32_t timeout = 0;
+
+    // Tunggu naik dari LOW ke HIGH, tapi dengan timeout
+    while (HAL_GPIO_ReadPin(SUHU_SENSOR_GPIO_Port, SUHU_SENSOR_Pin) == GPIO_PIN_RESET)
+    {
+        delay_us(1);
+        if (++timeout > 200) {
+            // timeout ~200 us, anggap bit = 0 dan keluar
+            return 0;
+        }
+    }
+
     delay_us(40);
     if (HAL_GPIO_ReadPin(SUHU_SENSOR_GPIO_Port, SUHU_SENSOR_Pin) == GPIO_PIN_SET)
         bit = 1;
-    while (HAL_GPIO_ReadPin(SUHU_SENSOR_GPIO_Port, SUHU_SENSOR_Pin) == GPIO_PIN_SET);
+
+    // Tunggu turun kembali ke LOW, juga dengan timeout
+    timeout = 0;
+    while (HAL_GPIO_ReadPin(SUHU_SENSOR_GPIO_Port, SUHU_SENSOR_Pin) == GPIO_PIN_SET)
+    {
+        delay_us(1);
+        if (++timeout > 200) {
+            break;  // paksa keluar supaya tidak hang
+        }
+    }
+
     return bit;
 }
 
@@ -909,6 +948,29 @@ uint8_t DHT22_Read(float *temperature, float *humidity)
     return 1;
 }
 
+/* ==================== I2C RECOVERY ==================== */
+static void I2C1_RecoverBus(void)
+{
+    HAL_I2C_DeInit(&hi2c1);
+    MX_I2C1_Init();    // re-init peripheral
+}
+
+static void I2C2_RecoverBus(void)
+{
+    HAL_I2C_DeInit(&hi2c2);
+    MX_I2C2_Init();    // re-init peripheral
+}
+
+/* Map HAL I2C status -> error code */
+static uint8_t I2C_StatusToErrCode(HAL_StatusTypeDef st)
+{
+    if (st == HAL_TIMEOUT) {
+        return ERR_TIMEOUT;
+    }
+    // HAL_ERROR atau HAL_BUSY -> treat as NOT_FOUND (device NACK / hilang)
+    return ERR_NOT_FOUND;
+}
+
 /* ==================== DS3231 RTC ==================== */
 static uint8_t bcd2bin(uint8_t val)
 {
@@ -923,11 +985,19 @@ static uint8_t bin2bcd(uint8_t val)
 uint8_t DS3231_ReadTime(DS3231_TimeTypeDef *t)
 {
     uint8_t buf[7];
+    HAL_StatusTypeDef st;
 
-    if (HAL_I2C_Mem_Read(&hi2c1, DS3231_ADDR, 0x00, I2C_MEMADD_SIZE_8BIT,
-                         buf, 7, 100) != HAL_OK)
-    {
-        return 0;
+    st = HAL_I2C_Mem_Read(&hi2c1, DS3231_ADDR, 0x00, I2C_MEMADD_SIZE_8BIT,
+                          buf, 7, 100);
+    if (st != HAL_OK) {
+        // Coba recovery I2C1 sekali
+        I2C1_RecoverBus();
+        st = HAL_I2C_Mem_Read(&hi2c1, DS3231_ADDR, 0x00, I2C_MEMADD_SIZE_8BIT,
+                              buf, 7, 100);
+        if (st != HAL_OK) {
+            // Biarkan App_HandleAcquisition yang meng-set Debug_ErrorJson/SendErrorTLV
+            return 0;
+        }
     }
 
     t->seconds   = bcd2bin(buf[0] & 0x7F);
@@ -1034,6 +1104,8 @@ static int16_t ADS1115_ReadRaw(uint8_t ch)
     uint8_t  cfg[3];
     uint8_t  rx[2];
     uint16_t config;
+    HAL_StatusTypeDef st;
+    uint8_t ec;   // error code
 
     config  = 0x8000U;
     config |= (uint16_t)((0x04U + ch) << 12);
@@ -1046,39 +1118,62 @@ static int16_t ADS1115_ReadRaw(uint8_t ch)
     cfg[1] = (uint8_t)(config >> 8);
     cfg[2] = (uint8_t)(config & 0xFF);
 
-    if (HAL_I2C_Master_Transmit(&hi2c2, ADS1115_ADDR, cfg, 3, 100) != HAL_OK) {
+    // TX config
+    st = HAL_I2C_Master_Transmit(&hi2c2, ADS1115_ADDR, cfg, 3, 100);
+    if (st != HAL_OK) {
+        I2C2_RecoverBus();
+        st = HAL_I2C_Master_Transmit(&hi2c2, ADS1115_ADDR, cfg, 3, 100);
+    }
+    if (st != HAL_OK) {
         if (!g_err_ads) {
             g_err_ads = 1;
-            Debug_ErrorJson("ADS", "I2C_TX_FAIL", "ADS1115 write config failed", 1);
-            SendErrorTLV(ERR_MOD_ADS, ERR_CODE_I2C_TX_FAIL, 1);
+            ec = I2C_StatusToErrCode(st);   // ERR_TIMEOUT atau ERR_NOT_FOUND
+            Debug_ErrorJson(MOD_ADS, ST_ERR, ec);
+            SendErrorTLV(MOD_ADS, ST_ERR, ec);
         }
         return 0;
     }
 
     HAL_Delay(8);
 
+    // Set register pointer ke 0x00
     cfg[0] = 0x00;
-    if (HAL_I2C_Master_Transmit(&hi2c2, ADS1115_ADDR, cfg, 1, 100) != HAL_OK) {
-        if (!g_err_ads) {
-            g_err_ads = 1;
-            Debug_ErrorJson("ADS", "I2C_TX_FAIL", "ADS1115 select reg failed", 1);
-            SendErrorTLV(ERR_MOD_ADS, ERR_CODE_I2C_TX_FAIL, 1);
-        }
-        return 0;
+    st = HAL_I2C_Master_Transmit(&hi2c2, ADS1115_ADDR, cfg, 1, 100);
+    if (st != HAL_OK) {
+        I2C2_RecoverBus();
+        st = HAL_I2C_Master_Transmit(&hi2c2, ADS1115_ADDR, cfg, 1, 100);
     }
-    if (HAL_I2C_Master_Receive(&hi2c2, ADS1115_ADDR, rx, 2, 100) != HAL_OK) {
+    if (st != HAL_OK) {
         if (!g_err_ads) {
             g_err_ads = 1;
-            Debug_ErrorJson("ADS", "I2C_RX_FAIL", "ADS1115 read data failed", 1);
-            SendErrorTLV(ERR_MOD_ADS, ERR_CODE_I2C_RX_FAIL, 1);
+            ec = I2C_StatusToErrCode(st);
+            Debug_ErrorJson(MOD_ADS, ST_ERR, ec);
+            SendErrorTLV(MOD_ADS, ST_ERR, ec);
         }
         return 0;
     }
 
+    // Read conversion
+    st = HAL_I2C_Master_Receive(&hi2c2, ADS1115_ADDR, rx, 2, 100);
+    if (st != HAL_OK) {
+        I2C2_RecoverBus();
+        st = HAL_I2C_Master_Receive(&hi2c2, ADS1115_ADDR, rx, 2, 100);
+    }
+    if (st != HAL_OK) {
+        if (!g_err_ads) {
+            g_err_ads = 1;
+            ec = I2C_StatusToErrCode(st);
+            Debug_ErrorJson(MOD_ADS, ST_ERR, ec);
+            SendErrorTLV(MOD_ADS, ST_ERR, ec);
+        }
+        return 0;
+    }
+
+    // Sampai sini semua OK, kalau sebelumnya error, kirim status OK
     if (g_err_ads) {
         g_err_ads = 0;
-        Debug_ErrorJson("ADS", "OK", "ADS1115 back online", 0);
-        SendErrorTLV(ERR_MOD_ADS, ERR_CODE_OK, 0);
+        Debug_ErrorJson(MOD_ADS, ST_OK, ERR_NONE);
+        SendErrorTLV(MOD_ADS, ST_OK, ERR_NONE);
     }
 
     return (int16_t)((rx[0] << 8) | rx[1]);
@@ -1086,11 +1181,13 @@ static int16_t ADS1115_ReadRaw(uint8_t ch)
 
 static uint8_t VoltageToPWM_0_255(float voltage)
 {
-    if (voltage < 0.0f) voltage = 0.0f;
-    if (voltage > 3.3f) voltage = 3.3f;
+    // Pastikan dalam range 0 .. ADC_INPUT_MAX_VOLT
+    if (voltage < 0.0f)            voltage = 0.0f;
+    if (voltage > ADC_INPUT_MAX_VOLT) voltage = ADC_INPUT_MAX_VOLT;
 
-    float scale = voltage / 3.3f;
-    uint8_t pwm = (uint8_t)(scale * 255.0f + 0.5f);
+    // Mapping linier 0..ADC_INPUT_MAX_VOLT -> 0..255
+    float scale = voltage / ADC_INPUT_MAX_VOLT;
+    uint8_t pwm = (uint8_t)(scale * 255.0f + 0.5f);  // +0.5 untuk pembulatan
 
     return pwm;
 }
@@ -1098,7 +1195,12 @@ static uint8_t VoltageToPWM_0_255(float voltage)
 static float ADS1115_ConvertRawToVolt(int16_t raw)
 {
     float v = (float)raw * ADS_FS_VOLT / 32768.0f;
-    return (v < 0.0f) ? 0.0f : v;
+
+    // Clamp ke 0 .. ADC_INPUT_MAX_VOLT
+    if (v < 0.0f)            v = 0.0f;
+    if (v > ADC_INPUT_MAX_VOLT) v = ADC_INPUT_MAX_VOLT;
+
+    return v;
 }
 
 static void ADS_Task(void)
@@ -1205,25 +1307,25 @@ static size_t TLV_EncodeMeasurement(const Measurement_t *m, uint8_t *out, size_t
     return idx;
 }
 
-static void SendErrorTLV(uint8_t moduleId, uint8_t code, uint8_t active)
+static void SendErrorTLV(uint8_t mid, uint8_t st, uint8_t ec)
 {
     uint8_t payload[16];
     size_t idx = 0;
 
-    // TAG_ERR_MODULE
+    // mid -> TLV_TAG_ERR_MODULE
     payload[idx++] = TLV_TAG_ERR_MODULE;
     payload[idx++] = 1;
-    payload[idx++] = moduleId;
+    payload[idx++] = mid;
 
-    // TAG_ERR_CODE
-    payload[idx++] = TLV_TAG_ERR_CODE;
-    payload[idx++] = 1;
-    payload[idx++] = code;
-
-    // TAG_ERR_ACTIVE
+    // st -> TLV_TAG_ERR_ACTIVE (pakai tag lama untuk "status")
     payload[idx++] = TLV_TAG_ERR_ACTIVE;
     payload[idx++] = 1;
-    payload[idx++] = active;
+    payload[idx++] = st;
+
+    // ec -> TLV_TAG_ERR_CODE
+    payload[idx++] = TLV_TAG_ERR_CODE;
+    payload[idx++] = 1;
+    payload[idx++] = ec;
 
     uint8_t frame[32];
     uint16_t fidx = 0;
@@ -1240,7 +1342,6 @@ static void SendErrorTLV(uint8_t moduleId, uint8_t code, uint8_t active)
     frame[fidx++] = (crc >> 8) & 0xFF;
     frame[fidx++] = crc & 0xFF;
 
-    // Kirim blocking; frame kecil
     HAL_UART_Transmit(&huart2, frame, fidx, 100);
 }
 
@@ -1282,11 +1383,6 @@ static bool SendMeasurementTLV(const Measurement_t *m)
 }
 
 /* ==================== TLV PARSER (from ESP32) ==================== */
-static uint16_t TLV_ReadU16BE(const uint8_t *p)
-{
-    return ((uint16_t)p[0] << 8) | p[1];
-}
-
 static uint32_t TLV_ReadU32BE(const uint8_t *p)
 {
     return ((uint32_t)p[0] << 24) |
@@ -1367,87 +1463,6 @@ static bool JSON_ParseSeqFromLine(const char *line, uint32_t *outSeq)
     p += 6;
     *outSeq = (uint32_t)strtoul(p, NULL, 10);
     return (*outSeq > 0);
-}
-
-static bool JSON_ParseToMeasurement(const char *json, Measurement_t *m)
-{
-    memset(m, 0, sizeof(*m));
-    const char *p;
-
-    // 1) Parse seq
-    p = strstr(json, "\"seq\":");
-    if (p) m->seq = (uint32_t)strtoul(p + 6, NULL, 10);
-
-    // 2) Parse timestamp "YYYY-MM-DDTHH:MM:SSZ"
-    p = strstr(json, "\"timestamp\":\"");
-    if (p) {
-        p += 13;
-        int Y, M, D, h, mi, s;
-        if (sscanf(p, "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &mi, &s) == 6) {
-            m->rtc.year    = (uint16_t)Y;
-            m->rtc.month   = (uint8_t)M;
-            m->rtc.day     = (uint8_t)D;
-            m->rtc.hours   = (uint8_t)h;
-            m->rtc.minutes = (uint8_t)mi;
-            m->rtc.seconds = (uint8_t)s;
-        }
-    }
-
-    // 3) Parse env.temp
-    p = strstr(json, "\"temp\":");
-    if (p) {
-        float f = strtof(p + 7, NULL);
-        m->temp = (int16_t)(f * 10.0f);
-    }
-
-    // 4) Parse env.hum
-    p = strstr(json, "\"hum\":");
-    if (p) {
-        float f = strtof(p + 6, NULL);
-        m->hum = (int16_t)(f * 10.0f);
-    }
-
-    // 5) Parse dig_in array
-    p = strstr(json, "\"dig_in\":[");
-    if (p) {
-        p += 10;
-        m->dig_in = 0;
-        for (uint8_t i = 0; i < NUM_INPUTS && *p; i++) {
-            while (*p == ' ') p++;
-            if (*p == '1') {
-                m->dig_in |= (1U << i);
-            }
-            while (*p && *p != ',' && *p != ']') p++;
-            if (*p == ',') p++;
-        }
-    }
-
-    // 6) Parse an_in array
-    p = strstr(json, "\"an_in\":[");
-    if (p) {
-        p += 9;
-        for (int i = 0; i < 4 && *p; i++) {
-            m->an_in[i] = (uint16_t)strtoul(p, (char**)&p, 10);
-            if (*p == ',') p++;
-        }
-    }
-
-    // 7) Parse q array
-    p = strstr(json, "\"q\":[");
-    if (p) {
-        p += 5;
-        m->q = 0;
-        for (uint8_t i = 0; i < NUM_OUTPUTS && *p; i++) {
-            while (*p == ' ') p++;
-            if (*p == '1') {
-                m->q |= (1U << i);
-            }
-            while (*p && *p != ',' && *p != ']') p++;
-            if (*p == ',') p++;
-        }
-    }
-
-    return (m->seq > 0);
 }
 
 /* ==================== UART CALLBACKS ==================== */
@@ -1782,27 +1797,46 @@ static void Log_InitRuntime(void)
 
 static bool SD_MountTask(void)
 {
+    static uint32_t lastTryMs   = 0;
+    static FRESULT  lastFr      = FR_OK;
+
     if (g_sd_mounted) return true;
+
+    uint32_t now = HAL_GetTick();
+    if ((now - lastTryMs) < 1000U) {   // coba tiap 1 detik
+        return false;
+    }
+    lastTryMs = now;
+
+    // Paksa init ulang disk (akan memanggil SD_disk_initialize)
+    disk_initialize(0);
 
     FRESULT fr = f_mount(&USERFatFS, (TCHAR const*)USERPath, 1);
     if (fr == FR_OK) {
         g_sd_mounted = 1;
+        lastFr       = fr;
+
         if (g_err_sd) {
             g_err_sd = 0;
-            Debug_ErrorJson("SD", "MOUNT_OK", "SD card mounted", 0);
-            SendErrorTLV(ERR_MOD_SD, ERR_CODE_OK, 0);
+            Debug_ErrorJson(MOD_SD, ST_OK, ERR_NONE);
+            SendErrorTLV(MOD_SD, ST_OK, ERR_NONE);
         }
         UART_Print("[SD] Mounted OK\r\n");
         return true;
     } else {
         if (!g_err_sd) {
             g_err_sd = 1;
-            Debug_ErrorJson("SD", "MOUNT_FAIL", "f_mount failed", 1);
-            SendErrorTLV(ERR_MOD_SD, ERR_CODE_MOUNT_FAIL, 1);
+            Debug_ErrorJson(MOD_SD, ST_ERR, ERR_NOT_FOUND);  // kartu / filesystem tidak ditemukan
+            SendErrorTLV(MOD_SD, ST_ERR, ERR_NOT_FOUND);
         }
-        snprintf(g_debugBuf, sizeof(g_debugBuf),
-                 "[SD] Mount ERR=%d\r\n", fr);
-        UART_Print(g_debugBuf);
+
+        // Hanya print kalau kode error berubah
+        if (fr != lastFr) {
+            lastFr = fr;
+            snprintf(g_debugBuf, sizeof(g_debugBuf),
+                     "[SD] Mount ERR=%d\r\n", fr);
+            UART_Print(g_debugBuf);
+        }
     }
     return false;
 }
@@ -1862,9 +1896,12 @@ static bool Log_AppendJSON(const char *jsonLine)
         UART_Print("[LOG] Open failed\r\n");
         if (!g_err_sd) {
             g_err_sd = 1;
-            Debug_ErrorJson("SD", "OPEN_FAIL", "open log.json failed", 1);
-            SendErrorTLV(ERR_MOD_SD, ERR_CODE_OPEN_FAIL, 1);
+            Debug_ErrorJson(MOD_SD, ST_ERR, ERR_NOT_FOUND);
+            SendErrorTLV(MOD_SD, ST_ERR, ERR_NOT_FOUND);
         }
+        f_close(&f);  // jaga-jaga
+        f_mount(NULL, (TCHAR const*)USERPath, 0); // unmount
+        g_sd_mounted = 0;
         return false;
     }
 
@@ -1878,16 +1915,19 @@ static bool Log_AppendJSON(const char *jsonLine)
         UART_Print("[LOG] Write failed\r\n");
         if (!g_err_sd) {
             g_err_sd = 1;
-            Debug_ErrorJson("SD", "WRITE_FAIL", "write log.json failed", 1);
-            SendErrorTLV(ERR_MOD_SD, ERR_CODE_WRITE_FAIL, 1);
+            Debug_ErrorJson(MOD_SD, ST_ERR, ERR_CRC);   // treat as data error
+            SendErrorTLV(MOD_SD, ST_ERR, ERR_CRC);
         }
+        f_close(&f);
+        f_mount(NULL, (TCHAR const*)USERPath, 0);
+        g_sd_mounted = 0;
         return false;
     }
 
     if (g_err_sd) {
         g_err_sd = 0;
-        Debug_ErrorJson("SD", "OK", "log.json write OK", 0);
-        SendErrorTLV(ERR_MOD_SD, ERR_CODE_OK, 0);
+        Debug_ErrorJson(MOD_SD, ST_OK, ERR_NONE);
+        SendErrorTLV(MOD_SD, ST_OK, ERR_NONE);
     }
 
     return true;
@@ -1899,6 +1939,8 @@ static bool Log_RemoveSeq(uint32_t seqToRemove)
     FRESULT fr = f_open(&f, LOG_FILE_NAME, FA_READ | FA_WRITE);
     if (fr != FR_OK) {
         UART_Print("[LOG] Open for remove failed\r\n");
+        f_mount(NULL, (TCHAR const*)USERPath, 0);
+        g_sd_mounted = 0;
         return false;
     }
 
@@ -1958,6 +2000,87 @@ static bool Log_RemoveSeq(uint32_t seqToRemove)
     return removed;
 }
 
+static void SD_StatusTask(uint32_t now)
+{
+    static uint32_t lastCheckMs = 0;
+
+    // Jalan tiap SD_STATUS_INTERVAL_MS (default 3000 ms)
+    if ((now - lastCheckMs) < SD_STATUS_INTERVAL_MS) {
+        return;
+    }
+    lastCheckMs = now;
+
+    // Kalau SD belum ter-mount, coba mount
+    if (!g_sd_mounted) {
+        SD_MountTask();
+        return;
+    }
+
+    // Ambil waktu sekarang dari RTC
+    DS3231_TimeTypeDef rtc;
+    if (!DS3231_ReadTime(&rtc)) {
+        // Kalau RTC gagal dibaca, tidak update status.json
+        return;
+    }
+
+    // Bentuk string timestamp ISO: "YYYY-MM-DDTHH:MM:SSZ"
+    char ts[32];
+    snprintf(ts, sizeof(ts), "%04u-%02u-%02uT%02u:%02u:%02uZ",
+             rtc.year, rtc.month, rtc.day,
+             rtc.hours, rtc.minutes, rtc.seconds);
+
+    // JSON 1 baris, berisi waktu terakhir online
+    // Contoh: {"last_online":"2025-01-08T12:34:56Z"}
+    char jsonLine[96];
+    int len = snprintf(jsonLine, sizeof(jsonLine),
+                       "{\"last_online\":\"%s\"}\r\n", ts);
+    if (len <= 0 || len >= (int)sizeof(jsonLine)) {
+        return;
+    }
+
+    FIL f;
+    FRESULT fr = f_open(&f, STATUS_FILE_NAME, FA_WRITE | FA_CREATE_ALWAYS);
+    if (fr != FR_OK) {
+        UART_Print("[STATUS] Open status.json failed\r\n");
+        if (!g_err_sd) {
+            g_err_sd = 1;
+            Debug_ErrorJson(MOD_SD, ST_ERR, ERR_NOT_FOUND);
+            SendErrorTLV(MOD_SD, ST_ERR, ERR_NOT_FOUND);
+        }
+        // Unmount supaya nanti dicoba mount ulang
+        f_mount(NULL, (TCHAR const*)USERPath, 0);
+        g_sd_mounted = 0;
+        return;
+    }
+
+    UINT bw;
+    fr = f_write(&f, jsonLine, len, &bw);
+    f_sync(&f);
+    f_close(&f);
+
+    if (fr != FR_OK || bw != (UINT)len) {
+        UART_Print("[STATUS] Write status.json failed\r\n");
+        if (!g_err_sd) {
+            g_err_sd = 1;
+            Debug_ErrorJson(MOD_SD, ST_ERR, ERR_CRC);
+            SendErrorTLV(MOD_SD, ST_ERR, ERR_CRC);
+        }
+        f_mount(NULL, (TCHAR const*)USERPath, 0);
+        g_sd_mounted = 0;
+        return;
+    }
+
+    // Kalau sebelumnya SD error lalu sekarang sukses, kirim status OK
+    if (g_err_sd) {
+        g_err_sd = 0;
+        Debug_ErrorJson(MOD_SD, ST_OK, ERR_NONE);
+        SendErrorTLV(MOD_SD, ST_OK, ERR_NONE);
+    }
+
+    // (Opsional) debug
+    // UART_Print("[STATUS] status.json updated\r\n");
+}
+
 /* ==================== APPLICATION ==================== */
 static void App_BackgroundSensors(uint32_t now)
 {
@@ -1966,6 +2089,7 @@ static void App_BackgroundSensors(uint32_t now)
     static uint16_t stableMask    = 0;
     static uint16_t lastRawMask   = 0;
     static uint32_t lastChangeMs  = 0;
+    static uint32_t lastRtcCheckMs = 0;
 
     if (!initialized)
     {
@@ -1996,16 +2120,16 @@ static void App_BackgroundSensors(uint32_t now)
             // Jika sebelumnya error, sekarang recover
             if (g_err_dht) {
                 g_err_dht = 0;
-                Debug_ErrorJson("DHT", "OK", "DHT22 back online", 0);
-                SendErrorTLV(ERR_MOD_DHT, ERR_CODE_OK, 0);
+                Debug_ErrorJson(MOD_DHT, ST_OK, ERR_NONE);
+                SendErrorTLV(MOD_DHT, ST_OK, ERR_NONE);
             }
         } else {
             // Baca GAGAL , tunda pelaporan selama 5 detik
             if ((now - g_bootMs) >= DHT_ERROR_ENABLE_DELAY_MS) {
                 if (!g_err_dht) {
                     g_err_dht = 1;
-                    Debug_ErrorJson("DHT", "READ_FAIL", "DHT22 read failed", 1);
-                    SendErrorTLV(ERR_MOD_DHT, ERR_CODE_READ_FAIL, 1);
+                    Debug_ErrorJson(MOD_DHT, ST_ERR, ERR_TIMEOUT);   // baca DHT timeout / gagal
+                    SendErrorTLV(MOD_DHT, ST_ERR, ERR_TIMEOUT);
                 }
             }
         }
@@ -2049,6 +2173,26 @@ static void App_BackgroundSensors(uint32_t now)
         PrintRuleStatus();
         g_ruleUpdated = 0;
     }
+
+    /*Update RTC*/
+    if ((now - lastRtcCheckMs) >= 2000U) {
+        lastRtcCheckMs = now;
+
+        DS3231_TimeTypeDef tmp;
+        if (!DS3231_ReadTime(&tmp)) {
+            if (!g_err_rtc) {
+                g_err_rtc = 1;
+                Debug_ErrorJson(MOD_RTC, ST_ERR, ERR_TIMEOUT);
+                SendErrorTLV(MOD_RTC, ST_ERR, ERR_TIMEOUT);
+            }
+        } else {
+            if (g_err_rtc) {
+                g_err_rtc = 0;
+                Debug_ErrorJson(MOD_RTC, ST_OK, ERR_NONE);
+                SendErrorTLV(MOD_RTC, ST_OK, ERR_NONE);
+            }
+        }
+    }
 }
 
 static void Acquire_FillMeasurement(Measurement_t *m, const DS3231_TimeTypeDef *rtc)
@@ -2075,54 +2219,45 @@ static void Acquire_FillMeasurement(Measurement_t *m, const DS3231_TimeTypeDef *
 
 static void App_HandleAcquisition(uint32_t now)
 {
-    static uint32_t lastLogTick      = 0;
-    static uint8_t  startupDelayDone = 0;
-    static uint32_t startupStartMs   = 0;
+    static uint32_t lastLogTick = 0;
+    static uint8_t  initialized = 0;
 
     bool needLog = false;
     bool byIo    = false;
 
-    if (!g_sd_mounted) return;
-
-    if (!startupDelayDone) {
-        if (startupStartMs == 0) {
-            startupStartMs = now;   // simpan waktu mulai
-        }
-
-        if ((now - startupStartMs) < STARTUP_DELAY_MS) {
-            // Masih dalam jeda, abaikan event IO dan jangan log/kirim
-            g_io_changed_flag = 0;
-            return;
-        }
-
-        // Jeda selesai → mulai siklus normal
-        startupDelayDone = 1;
-        lastLogTick      = now;    // reset timer periodik
+    // Inisialisasi pertama kali: mulai hitung interval dari waktu boot
+    if (!initialized) {
+        lastLogTick = now;
+        initialized = 1;
     }
 
-    // 1) Trigger: I/O change
+    // 1) Trigger: perubahan input (langsung kirim, reset interval)
     if (g_io_changed_flag) {
         g_io_changed_flag = 0;
         needLog = true;
         byIo    = true;
     }
 
-    // 2) Periodic (setiap DELIVERY_TIME_INTERVAL, misal 60 detik)
+    // 2) Periodik: tiap DELIVERY_TIME_INTERVAL (misalnya 60000 ms)
     if (!needLog && (now - lastLogTick) >= DELIVERY_TIME_INTERVAL) {
         needLog = true;
         byIo    = false;
     }
 
     if (!needLog) return;
+
+    // Reset base waktu interval ke saat pengiriman ini
     lastLogTick = now;
 
-    // 3) Read RTC
+    // ======= Di bawah ini biarkan persis seperti semula =======
+
+    // 3) Baca RTC
     DS3231_TimeTypeDef rtc;
     if (!DS3231_ReadTime(&rtc)) {
         if (!g_err_rtc) {
             g_err_rtc = 1;
-            Debug_ErrorJson("RTC", "READ_FAIL", "DS3231 read failed", 1);
-            SendErrorTLV(ERR_MOD_RTC, ERR_CODE_READ_FAIL, 1);
+            Debug_ErrorJson(MOD_RTC, ST_ERR, ERR_TIMEOUT);
+            SendErrorTLV(MOD_RTC, ST_ERR, ERR_TIMEOUT);
         }
         memset(&rtc, 0, sizeof(rtc));
         rtc.year  = 2000;
@@ -2131,46 +2266,58 @@ static void App_HandleAcquisition(uint32_t now)
     } else {
         if (g_err_rtc) {
             g_err_rtc = 0;
-            Debug_ErrorJson("RTC", "READ_OK", "DS3231 back online", 0);
-            SendErrorTLV(ERR_MOD_RTC, ERR_CODE_OK, 0);
+            Debug_ErrorJson(MOD_RTC, ST_OK, ERR_NONE);
+            SendErrorTLV(MOD_RTC, ST_OK, ERR_NONE);
         }
     }
 
-    // 4) Fill measurement
+    // 4) Isi measurement
     Measurement_t m;
     Acquire_FillMeasurement(&m, &rtc);
 
-    // 5) Encode to JSON for SD card
-    char jsonLine[JSON_LINE_MAX];
+    // 5) Encode JSON (untuk SD & debug)
+    char  jsonLine[JSON_LINE_MAX];
     size_t jsonLen = JSON_EncodeMeasurement(&m, jsonLine, sizeof(jsonLine));
     if (jsonLen == 0) {
         UART_Print("[ACQ] JSON encode failed\r\n");
         return;
     }
 
-    // 6) Simpan ke log.json
-    if (Log_AppendJSON(jsonLine)) {
-        Debug_PrintMeasurementJSON(&m, byIo);
+    // 6) Debug ke UART selalu (USART1)
+    Debug_PrintMeasurementJSON(&m, byIo);
 
-        // 7) Kirim TLV measurement ke ESP
-        if (!SendMeasurementTLV(&m)) {
-            UART_Print("[ACQ] TLV send failed (data tetap di log)\r\n");
+    // 7) Kalau SD ter-mount, simpan ke log.json
+    if (g_sd_mounted) {
+        if (!Log_AppendJSON(jsonLine)) {
+            UART_Print("[ACQ] Log append failed\r\n");
+            // Tetap lanjut kirim TLV
         }
-
-        // Seq berikutnya
-        g_nextSeq++;
-    } else {
-        UART_Print("[ACQ] Log append failed\r\n");
     }
+
+    // 8) SELALU kirim TLV ke ESP32 via USART2
+    if (!SendMeasurementTLV(&m)) {
+        UART_Print("[ACQ] TLV send failed (data mungkin hilang)\r\n");
+    }
+
+    // 9) Naikkan seq
+    g_nextSeq++;
 }
 
 static void App_HandleAck(void)
 {
-    if (!g_sd_mounted) return;
     if (!g_ack_pending) return;
 
     uint32_t seq = g_ack_seq;
     g_ack_pending = 0;
+
+    if (!g_sd_mounted) {
+        // Tidak ada log untuk dihapus, cukup info saja
+        snprintf(g_debugBuf, sizeof(g_debugBuf),
+                 "[ACK] seq=%lu (no SD, nothing to remove)\r\n",
+                 (unsigned long)seq);
+        UART_Print(g_debugBuf);
+        return;
+    }
 
     bool removed = Log_RemoveSeq(seq);
 
@@ -2179,14 +2326,14 @@ static void App_HandleAck(void)
              (unsigned long)seq, removed ? "YES" : "NO");
     UART_Print(g_debugBuf);
 }
+
 /* ==================== DEBUG ==================== */
-static void Debug_ErrorJson(const char* module, const char* code, const char* msg, uint8_t active)
+static void Debug_ErrorJson(uint8_t mid, uint8_t st, uint8_t ec)
 {
-    // active: 1 = error terjadi, 0 = recovery
+    // Format baru: {"mid":1,"st":1,"ec":2}
     snprintf(g_debugBuf, sizeof(g_debugBuf),
-             "[ERR]{\"type\":\"error\",\"module\":\"%s\","
-             "\"code\":\"%s\",\"active\":%u,\"msg\":\"%s\"}\r\n",
-             module, code, active, msg);
+             "[ERR]{\"mid\":%u,\"st\":%u,\"ec\":%u}\r\n",
+             mid, st, ec);
     UART_Print(g_debugBuf);
 }
 

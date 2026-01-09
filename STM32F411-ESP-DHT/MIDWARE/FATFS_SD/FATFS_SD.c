@@ -18,8 +18,14 @@ static volatile DSTATUS Stat = STA_NOINIT;  /* Disk Status */
 uint16_t Timer1, Timer2; 		/* 1ms Timer Counters */
 static uint8_t CardType; 		/* Type 0:MMC, 1:SDC, 2:Block addressing */
 static uint8_t PowerFlag = 0;	/* Power flag */
+extern UART_HandleTypeDef huart1;
+static void SD_DebugPrint(const char *s);
 
 //-----[ SPI Functions ]-----
+
+static void SD_DebugPrint(const char *s) {
+    HAL_UART_Transmit(&huart1, (uint8_t*)s, strlen(s), 100);
+}
 
 /* slave select */
 static void SELECT(void)
@@ -212,9 +218,14 @@ static BYTE SD_SendCmd(BYTE cmd, uint32_t arg)
 /* initialize SD */
 DSTATUS SD_disk_initialize(BYTE drv)
 {
+//	SD_DebugPrint("[SD_DRV] SD_disk_initialize called\r\n");
   uint8_t n, type, ocr[4];
   /* single drive, drv should be 0 */
   if(drv) return STA_NOINIT;
+
+  /*Reset status setiap kali init*/
+  Stat     = STA_NOINIT;
+  CardType = 0;
   /* no disk */
   if(Stat & STA_NODISK) return Stat;
   /* power on */
@@ -290,6 +301,7 @@ DSTATUS SD_disk_initialize(BYTE drv)
   {
     /* Initialization failed */
     SD_PowerOff();
+    Stat = STA_NOINIT | STA_NODISK;
   }
   return Stat;
 }
