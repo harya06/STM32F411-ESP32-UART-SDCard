@@ -1,0 +1,20 @@
+{
+  "device": {
+    "boxID": 1
+  },
+  "network": {
+    "mode": "hybrid",
+    "priority": "wifi"
+  },
+  "transport": {
+    "type": "tcp",
+    "host": "mqtt.thingsboard.cloud",
+    "port": 1883,
+    "path": "/wsiot"
+  },
+  "wifi": {
+    "ssid": "Alaadiyaat",
+    "password": "alaadiyaat25"
+  },
+  "rules": []
+}
