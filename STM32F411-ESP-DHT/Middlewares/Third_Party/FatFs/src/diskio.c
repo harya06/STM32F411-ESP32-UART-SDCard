@@ -52,18 +52,17 @@ DSTATUS disk_initialize (
 	BYTE pdrv				/* Physical drive nmuber to identify the drive */
 )
 {
-	DSTATUS stat;
+  DSTATUS stat = RES_OK;
 
-	// SELALU panggil driver low-level untuk dukung hot-plug
-	stat = disk.drv[pdrv]->disk_initialize(disk.lun[pdrv]);
-
-	if (stat == RES_OK) {
-	  disk.is_initialized[pdrv] = 1;
-	} else {
-	  disk.is_initialized[pdrv] = 0;   // supaya next time tetap di-init lagi
-	}
-
-	return stat;
+  if(disk.is_initialized[pdrv] == 0)
+  {
+    stat = disk.drv[pdrv]->disk_initialize(disk.lun[pdrv]);
+    if(stat == RES_OK)
+    {
+      disk.is_initialized[pdrv] = 1;
+    }
+  }
+  return stat;
 }
 
 /**

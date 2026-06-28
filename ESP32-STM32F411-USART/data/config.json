@@ -7,7 +7,7 @@
     "priority": "wifi"
   },
   "transport": {
-    "type": "tcp",
+    "type": "mqtt",
     "host": "mqtt.thingsboard.cloud",
     "port": 1883,
     "path": "/wsiot"

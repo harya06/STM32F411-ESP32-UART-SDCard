@@ -96,11 +96,12 @@ typedef struct {
 
 /* TX Context */
 typedef struct {
-    uint32_t seq;
-    char     jsonLine[320];
-    uint16_t jsonLen;
-    uint8_t  retryCount;
-    uint32_t ackDeadlineMs;
+    uint32_t       seq;
+    char           jsonLine[320];
+    uint16_t       jsonLen;
+    uint8_t        retryCount;
+    uint32_t       ackDeadlineMs;
+    Measurement_t  measurement;   /* simpan data penuh utk retry TLV identik */
 } TxContext_t;
 
 /* Application State */
@@ -121,6 +122,17 @@ typedef enum {
     TX_STATE_RETRY_OR_FAIL,
     TX_STATE_MOVE_TO_ERROR
 } TxState_t;
+
+typedef struct
+{
+    uint8_t sensor;
+    uint8_t acquisition;
+    uint8_t ack;
+    uint8_t tx;
+    uint8_t sd;
+} WatchdogHealth_t;
+
+static WatchdogHealth_t wd;
 
 /* USER CODE END PTD */
 
@@ -214,6 +226,8 @@ typedef enum {
 I2C_HandleTypeDef hi2c1;
 I2C_HandleTypeDef hi2c2;
 
+IWDG_HandleTypeDef hiwdg;
+
 SPI_HandleTypeDef hspi1;
 
 UART_HandleTypeDef huart1;
@@ -261,6 +275,10 @@ volatile uint8_t g_io_changed_flag = 0;
 volatile uint8_t  g_ack_pending = 0;
 volatile uint32_t g_ack_seq     = 0;
 
+/* TX state machine */
+static TxState_t   g_txState = TX_STATE_IDLE;
+static TxContext_t g_txCtx;
+
 /* Error flags */
 static uint8_t g_err_rtc = 0;
 static uint8_t g_err_dht = 0;
@@ -304,6 +322,7 @@ static void MX_USART2_UART_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_I2C2_Init(void);
 static void MX_SPI1_Init(void);
+static void MX_IWDG_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* Utility */
@@ -370,6 +389,10 @@ static bool Log_RemoveSeq(uint32_t seqToRemove);
 static bool SendMeasurementTLV(const Measurement_t *m);
 static void App_HandleAck(void);
 
+/* TX state machine */
+static void TX_StartNew(const Measurement_t *m);
+static void TX_Process(uint32_t now);
+
 /* SD Card & Log (JSON format) */
 static void Log_InitRuntime(void);
 static bool SD_MountTask(void);
@@ -387,6 +410,8 @@ static void Debug_ErrorJson(uint8_t mid, uint8_t st, uint8_t ec);
 static void Debug_PrintMeasurementJSON(const Measurement_t *m, bool byIo);
 static void Debug_DumpTLV(const char *prefix, const uint8_t *tlv, size_t len);
 
+static void WD_Service(void);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -396,6 +421,31 @@ static void Debug_DumpTLV(const char *prefix, const uint8_t *tlv, size_t len);
 static void UART_Print(const char* str)
 {
     HAL_UART_Transmit(&huart1, (uint8_t *)str, strlen(str), 100);
+}
+
+static inline void WD_SetSensor(void)
+{
+    wd.sensor = 1;
+}
+
+static inline void WD_SetAcquisition(void)
+{
+    wd.acquisition = 1;
+}
+
+static inline void WD_SetAck(void)
+{
+    wd.ack = 1;
+}
+
+static inline void WD_SetTX(void)
+{
+    wd.tx = 1;
+}
+
+static inline void WD_SetSD(void)
+{
+    wd.sd = 1;
 }
 
 /* USER CODE END 0 */
@@ -437,6 +487,7 @@ int main(void)
   MX_I2C2_Init();
   MX_SPI1_Init();
   MX_FATFS_Init();
+  MX_IWDG_Init();
   /* USER CODE BEGIN 2 */
 
   UART_Print("\r\n");
@@ -488,9 +539,21 @@ int main(void)
           }
 
           App_BackgroundSensors(now);
+          WD_SetSensor();
+
           App_HandleAcquisition(now);
+          WD_SetAcquisition();
+
           App_HandleAck();
+          WD_SetAck();
+
+          TX_Process(now);
+          WD_SetTX();
+
           SD_StatusTask(now);
+          WD_SetSD();
+
+          WD_Service();
 
           break;
 
@@ -524,9 +587,10 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_LSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
   RCC_OscInitStruct.PLL.PLLM = 8;
@@ -622,6 +686,34 @@ static void MX_I2C2_Init(void)
 }
 
 /**
+  * @brief IWDG Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_IWDG_Init(void)
+{
+
+  /* USER CODE BEGIN IWDG_Init 0 */
+
+  /* USER CODE END IWDG_Init 0 */
+
+  /* USER CODE BEGIN IWDG_Init 1 */
+
+  /* USER CODE END IWDG_Init 1 */
+  hiwdg.Instance = IWDG;
+  hiwdg.Init.Prescaler = IWDG_PRESCALER_64;
+  hiwdg.Init.Reload = 999;
+  if (HAL_IWDG_Init(&hiwdg) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN IWDG_Init 2 */
+
+  /* USER CODE END IWDG_Init 2 */
+
+}
+
+/**
   * @brief SPI1 Initialization Function
   * @param None
   * @retval None
@@ -689,6 +781,12 @@ static void MX_USART1_UART_Init(void)
   /* USER CODE BEGIN USART1_Init 2 */
   HAL_UART_Receive_IT(&huart1, &g_rs485RxByte, 1);
 
+  /* Priority lebih rendah dari USART2 (yg di-set 5,0) - RS485/debug
+     tidak boleh starvasi link data kritis ke ESP32 saat dua interrupt
+     datang berdekatan. Angka NVIC lebih besar = priority eksekusi
+     lebih rendah di Cortex-M. */
+  HAL_NVIC_SetPriority(USART1_IRQn, 6, 0);
+  HAL_NVIC_EnableIRQ(USART1_IRQn);
   /* USER CODE END USART1_Init 2 */
 
 }
@@ -742,9 +840,13 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(SUHU_SENSOR_GPIO_Port, SUHU_SENSOR_Pin, GPIO_PIN_RESET);
@@ -753,12 +855,19 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(SD_CS_GPIO_Port, SD_CS_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, OUTPUT_4_Pin|OUTPUT_3_Pin|OUTPUT_2_Pin|OUTPUT_1_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, OUTPUT_2_Pin|OUTPUT_1_Pin|OUTPUT_3_Pin|OUTPUT_4_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : INPUT_1_Pin INPUT_8_Pin INPUT_9_Pin INPUT_10_Pin
-                           INPUT_11_Pin */
-  GPIO_InitStruct.Pin = INPUT_1_Pin|INPUT_8_Pin|INPUT_9_Pin|INPUT_10_Pin
-                          |INPUT_11_Pin;
+  /*Configure GPIO pin : PC13 */
+  GPIO_InitStruct.Pin = GPIO_PIN_13;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : INPUT_11_Pin INPUT_3_Pin INPUT_4_Pin INPUT_5_Pin
+                           INPUT_6_Pin */
+  GPIO_InitStruct.Pin = INPUT_11_Pin|INPUT_3_Pin|INPUT_4_Pin|INPUT_5_Pin
+                          |INPUT_6_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
@@ -777,19 +886,19 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(SD_CS_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : INPUT_2_Pin INPUT_3_Pin INPUT_4_Pin INPUT_5_Pin
-                           INPUT_6_Pin INPUT_7_Pin */
-  GPIO_InitStruct.Pin = INPUT_2_Pin|INPUT_3_Pin|INPUT_4_Pin|INPUT_5_Pin
-                          |INPUT_6_Pin|INPUT_7_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : OUTPUT_4_Pin OUTPUT_3_Pin OUTPUT_2_Pin OUTPUT_1_Pin */
-  GPIO_InitStruct.Pin = OUTPUT_4_Pin|OUTPUT_3_Pin|OUTPUT_2_Pin|OUTPUT_1_Pin;
+  /*Configure GPIO pins : OUTPUT_2_Pin OUTPUT_1_Pin OUTPUT_3_Pin OUTPUT_4_Pin */
+  GPIO_InitStruct.Pin = OUTPUT_2_Pin|OUTPUT_1_Pin|OUTPUT_3_Pin|OUTPUT_4_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : INPUT_1_Pin INPUT_2_Pin INPUT_7_Pin INPUT_8_Pin
+                           INPUT_9_Pin INPUT_10_Pin */
+  GPIO_InitStruct.Pin = INPUT_1_Pin|INPUT_2_Pin|INPUT_7_Pin|INPUT_8_Pin
+                          |INPUT_9_Pin|INPUT_10_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
@@ -2294,10 +2403,11 @@ static void App_HandleAcquisition(uint32_t now)
         }
     }
 
-    // 8) SELALU kirim TLV ke ESP32 via USART2
-    if (!SendMeasurementTLV(&m)) {
-        UART_Print("[ACQ] TLV send failed (data mungkin hilang)\r\n");
-    }
+    // 8) Serahkan ke TX state machine (non-blocking, dgn retry otomatis)
+    //    Data SUDAH aman di log.json dari langkah 7 di atas - kalau
+    //    TX_StartNew menolak karena masih busy, tidak ada data hilang,
+    //    hanya pengiriman ke ESP32 yang tertunda ke siklus berikutnya.
+    TX_StartNew(&m);
 
     // 9) Naikkan seq
     g_nextSeq++;
@@ -2325,6 +2435,174 @@ static void App_HandleAck(void)
              "[ACK] seq=%lu, removed_from_log=%s\r\n",
              (unsigned long)seq, removed ? "YES" : "NO");
     UART_Print(g_debugBuf);
+}
+
+/* ----------------------------------------------------------------------
+   TX_StartNew()
+   Dipanggil dari App_HandleAcquisition() SEBAGAI PENGGANTI panggilan
+   langsung ke SendMeasurementTLV(&m). Tidak langsung kirim - hanya
+   menyiapkan context dan menyerahkan eksekusi ke TX_Process() yang
+   berjalan non-blocking tiap iterasi main loop.
+
+   Kalau TX sebelumnya masih berjalan (state != IDLE), measurement baru
+   TIDAK ditembak (supaya tidak menimpa context yang sedang retry/wait-ack).
+   Data measurement yang baru tetap sudah aman di log.json (sudah dipanggil
+   Log_AppendJSON sebelum titik ini di App_HandleAcquisition), jadi tidak
+   ada data yang hilang - hanya pengiriman TLV-nya yang ditunda ke siklus
+   App_HandleAcquisition berikutnya.
+   ---------------------------------------------------------------------- */
+static void TX_StartNew(const Measurement_t *m)
+{
+    if (g_txState != TX_STATE_IDLE)
+    {
+        snprintf(g_debugBuf, sizeof(g_debugBuf),
+                 "[TX] busy (state=%d), seq=%lu tetap di log.json, kirim ditunda\r\n",
+                 (int)g_txState, (unsigned long)m->seq);
+        UART_Print(g_debugBuf);
+        return;
+    }
+
+    g_txCtx.seq         = m->seq;
+    g_txCtx.measurement = *m;          /* copy penuh, dipakai ulang saat retry */
+    g_txCtx.retryCount  = 0;
+    g_txCtx.jsonLen     = 0;           /* tidak dipakai di jalur TLV, dibiarkan utk kompatibilitas struct */
+
+    g_txState = TX_STATE_SEND_FRAME;
+}
+
+/* ----------------------------------------------------------------------
+   TX_Process()
+   Dipanggil SETIAP iterasi while(1) di main(), tanpa blocking dan tanpa
+   HAL_Delay di dalamnya. Mengeksekusi satu state per pemanggilan.
+
+   Alur:
+     IDLE            -> menunggu TX_StartNew() dipanggil
+     SEND_FRAME      -> kirim TLV via SendMeasurementTLV (re-encode dari
+                        g_txCtx.measurement, jadi retry kirim ulang frame
+                        yang identik)
+     WAIT_TX_COMPLETE-> (di implementasi ini SendMeasurementTLV blocking
+                        HAL_UART_Transmit dengan timeout 200ms, sudah
+                        cukup singkat - state ini dilewati langsung ke
+                        WAIT_ACK. Disediakan di enum utk pengembangan
+                        DMA/IT based transmit di masa depan)
+     WAIT_ACK        -> polling g_ack_pending (diisi ISR USART2) sampai
+                        match seq atau timeout ACK_TIMEOUT_MS
+     ACK_OK          -> hapus baris log.json utk seq ini, balik ke IDLE
+     RETRY_OR_FAIL   -> increment retryCount, ulang SEND_FRAME kalau
+                        masih di bawah TX_MAX_RETRY, kalau tidak pindah
+                        ke MOVE_TO_ERROR
+     MOVE_TO_ERROR   -> log kegagalan permanen, data TETAP ada di
+                        log.json (tidak dihapus - itulah keamanannya),
+                        balik ke IDLE supaya measurement berikutnya
+                        tidak ikut macet
+   ---------------------------------------------------------------------- */
+static void TX_Process(uint32_t now)
+{
+    switch (g_txState)
+    {
+    case TX_STATE_IDLE:
+        /* tidak ada TX aktif */
+        break;
+
+    case TX_STATE_SEND_FRAME:
+        if (SendMeasurementTLV(&g_txCtx.measurement))
+        {
+            g_txCtx.ackDeadlineMs = now + ACK_TIMEOUT_MS;
+            g_txState = TX_STATE_WAIT_ACK;
+        }
+        else
+        {
+            /* UART_Transmit gagal (HAL_BUSY/HAL_ERROR) - kemungkinan
+               line sedang dipakai. Langsung ke retry, bukan ke error,
+               karena ini biasanya transient. */
+            g_txState = TX_STATE_RETRY_OR_FAIL;
+        }
+        break;
+
+    case TX_STATE_WAIT_TX_COMPLETE:
+        /* Tidak dipakai pada implementasi UART blocking saat ini.
+           Disediakan utk migrasi ke HAL_UART_Transmit_IT/DMA nanti -
+           pada saat itu state ini menunggu callback TxCpltCallback
+           sebelum lanjut ke WAIT_ACK. */
+        g_txState = TX_STATE_WAIT_ACK;
+        break;
+
+    case TX_STATE_WAIT_ACK:
+        if (g_ack_pending && g_ack_seq == g_txCtx.seq)
+        {
+            g_ack_pending = 0;
+            g_txState = TX_STATE_ACK_OK;
+        }
+        else if ((int32_t)(now - g_txCtx.ackDeadlineMs) >= 0)
+        {
+            snprintf(g_debugBuf, sizeof(g_debugBuf),
+                     "[TX] ACK timeout seq=%lu\r\n",
+                     (unsigned long)g_txCtx.seq);
+            UART_Print(g_debugBuf);
+            g_txState = TX_STATE_RETRY_OR_FAIL;
+        }
+        /* kalau ACK datang dengan seq BERBEDA dari yang ditunggu,
+           dibiarkan saja di sini - kemungkinan ACK basi dari frame
+           sebelumnya yang sudah lewat timeout-nya sendiri. Dibuang
+           secara implisit pada iterasi berikutnya karena g_ack_pending
+           akan ditimpa ACK baru atau tetap stale (tidak match selamanya
+           sampai ada ACK baru yang benar). */
+        break;
+
+    case TX_STATE_ACK_OK:
+        if (g_sd_mounted)
+        {
+            bool removed = Log_RemoveSeq(g_txCtx.seq);
+            snprintf(g_debugBuf, sizeof(g_debugBuf),
+                     "[TX] ACK OK seq=%lu, log_removed=%s\r\n",
+                     (unsigned long)g_txCtx.seq, removed ? "YES" : "NO");
+            UART_Print(g_debugBuf);
+        }
+        else
+        {
+            snprintf(g_debugBuf, sizeof(g_debugBuf),
+                     "[TX] ACK OK seq=%lu (no SD mounted)\r\n",
+                     (unsigned long)g_txCtx.seq);
+            UART_Print(g_debugBuf);
+        }
+        g_txState = TX_STATE_IDLE;
+        break;
+
+    case TX_STATE_RETRY_OR_FAIL:
+        g_txCtx.retryCount++;
+        if (g_txCtx.retryCount < TX_MAX_RETRY)
+        {
+            snprintf(g_debugBuf, sizeof(g_debugBuf),
+                     "[TX] retry %u/%u seq=%lu\r\n",
+                     g_txCtx.retryCount, TX_MAX_RETRY,
+                     (unsigned long)g_txCtx.seq);
+            UART_Print(g_debugBuf);
+            g_txState = TX_STATE_SEND_FRAME;
+        }
+        else
+        {
+            g_txState = TX_STATE_MOVE_TO_ERROR;
+        }
+        break;
+
+    case TX_STATE_MOVE_TO_ERROR:
+        /* Data TIDAK dihapus dari log.json - itu poin pentingnya.
+           Kegagalan kirim TLV ke ESP32 tidak berarti data hilang;
+           tetap tersimpan di SD utk dikirim manual/recovery nanti.
+           Kembali ke IDLE supaya measurement BERIKUTNYA (siklus
+           App_HandleAcquisition selanjutnya) tidak ikut tersumbat
+           oleh kegagalan yang sudah permanen ini. */
+        snprintf(g_debugBuf, sizeof(g_debugBuf),
+                 "[TX] FAILED permanen seq=%lu setelah %u retry, data tetap di log.json\r\n",
+                 (unsigned long)g_txCtx.seq, TX_MAX_RETRY);
+        UART_Print(g_debugBuf);
+        g_txState = TX_STATE_IDLE;
+        break;
+
+    default:
+        g_txState = TX_STATE_IDLE;
+        break;
+    }
 }
 
 /* ==================== DEBUG ==================== */
@@ -2493,6 +2771,24 @@ static void Debug_DumpTLV(const char *prefix, const uint8_t *tlv, size_t len)
         }
 
         i += l;
+    }
+}
+
+static void WD_Service(void)
+{
+    if (wd.sensor &&
+        wd.acquisition &&
+        wd.ack &&
+        wd.tx &&
+        wd.sd)
+    {
+        HAL_IWDG_Refresh(&hiwdg);
+
+        wd.sensor = 0;
+        wd.acquisition = 0;
+        wd.ack = 0;
+        wd.tx = 0;
+        wd.sd = 0;
     }
 }
 

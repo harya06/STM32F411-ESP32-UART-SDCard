@@ -57,40 +57,40 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
-#define INPUT_1_Pin GPIO_PIN_0
-#define INPUT_1_GPIO_Port GPIOA
+#define INPUT_11_Pin GPIO_PIN_0
+#define INPUT_11_GPIO_Port GPIOA
 #define SUHU_SENSOR_Pin GPIO_PIN_1
 #define SUHU_SENSOR_GPIO_Port GPIOA
 #define SD_CS_Pin GPIO_PIN_4
 #define SD_CS_GPIO_Port GPIOA
-#define INPUT_2_Pin GPIO_PIN_0
-#define INPUT_2_GPIO_Port GPIOB
-#define INPUT_3_Pin GPIO_PIN_1
-#define INPUT_3_GPIO_Port GPIOB
-#define INPUT_4_Pin GPIO_PIN_12
-#define INPUT_4_GPIO_Port GPIOB
-#define INPUT_5_Pin GPIO_PIN_13
-#define INPUT_5_GPIO_Port GPIOB
-#define INPUT_6_Pin GPIO_PIN_14
-#define INPUT_6_GPIO_Port GPIOB
-#define INPUT_7_Pin GPIO_PIN_15
-#define INPUT_7_GPIO_Port GPIOB
-#define INPUT_8_Pin GPIO_PIN_8
-#define INPUT_8_GPIO_Port GPIOA
-#define INPUT_9_Pin GPIO_PIN_11
-#define INPUT_9_GPIO_Port GPIOA
-#define INPUT_10_Pin GPIO_PIN_12
-#define INPUT_10_GPIO_Port GPIOA
-#define INPUT_11_Pin GPIO_PIN_15
-#define INPUT_11_GPIO_Port GPIOA
-#define OUTPUT_4_Pin GPIO_PIN_4
-#define OUTPUT_4_GPIO_Port GPIOB
-#define OUTPUT_3_Pin GPIO_PIN_5
-#define OUTPUT_3_GPIO_Port GPIOB
-#define OUTPUT_2_Pin GPIO_PIN_8
+#define OUTPUT_2_Pin GPIO_PIN_0
 #define OUTPUT_2_GPIO_Port GPIOB
-#define OUTPUT_1_Pin GPIO_PIN_9
+#define OUTPUT_1_Pin GPIO_PIN_1
 #define OUTPUT_1_GPIO_Port GPIOB
+#define OUTPUT_3_Pin GPIO_PIN_12
+#define OUTPUT_3_GPIO_Port GPIOB
+#define OUTPUT_4_Pin GPIO_PIN_13
+#define OUTPUT_4_GPIO_Port GPIOB
+#define INPUT_1_Pin GPIO_PIN_14
+#define INPUT_1_GPIO_Port GPIOB
+#define INPUT_2_Pin GPIO_PIN_15
+#define INPUT_2_GPIO_Port GPIOB
+#define INPUT_3_Pin GPIO_PIN_8
+#define INPUT_3_GPIO_Port GPIOA
+#define INPUT_4_Pin GPIO_PIN_11
+#define INPUT_4_GPIO_Port GPIOA
+#define INPUT_5_Pin GPIO_PIN_12
+#define INPUT_5_GPIO_Port GPIOA
+#define INPUT_6_Pin GPIO_PIN_15
+#define INPUT_6_GPIO_Port GPIOA
+#define INPUT_7_Pin GPIO_PIN_4
+#define INPUT_7_GPIO_Port GPIOB
+#define INPUT_8_Pin GPIO_PIN_5
+#define INPUT_8_GPIO_Port GPIOB
+#define INPUT_9_Pin GPIO_PIN_8
+#define INPUT_9_GPIO_Port GPIOB
+#define INPUT_10_Pin GPIO_PIN_9
+#define INPUT_10_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 

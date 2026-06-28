@@ -1,11 +1,10 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <title>IoT-Node Device Configuration</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-
-  <style>
+<meta charset="utf-8" />
+<title>IoT-Node Configuration</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
     :root {
       --bg: #f2f4f7;
       --card: #ffffff;
@@ -13,6 +12,7 @@
       --primary: #2563eb;
       --success: #16a34a;
       --danger: #dc2626;
+      --warning: #f59e0b;
       --text: #111827;
       --muted: #6b7280;
     }
@@ -53,26 +53,25 @@
       padding: 0 16px;
     }
 
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px;
+      margin-bottom: 20px;
+    }
+
     .card h3 {
       display: flex;
       align-items: center;
       gap: 8px;
+      margin-top: 0;
     }
 
     .card h3::before {
       content: "▌";
       color: var(--primary);
       font-weight: bold;
-    }
-
-    .action-bar {
-      display: flex;
-      gap: 12px;
-      margin-top: 20px;
-    }
-
-    .action-bar button {
-      flex: 1;
     }
 
     .grid {
@@ -107,28 +106,6 @@
       color: #9ca3af;
     }
 
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      margin-top: 12px;
-    }
-
-    table tbody tr:hover {
-      background: #f8fafc;
-    }
-
-    th, td {
-      border: 1px solid var(--border);
-      padding: 10px;
-      text-align: center;
-      font-size: 14px;
-    }
-
-    th {
-      background: #f8fafc;
-      color: var(--muted);
-    }
-
     .btn {
       padding: 10px 14px;
       border-radius: 6px;
@@ -138,48 +115,149 @@
       cursor: pointer;
     }
 
-    .btn-add {
-      background: var(--success);
-      color: #fff;
-      margin-bottom: 8px;
-    }
-
-    .btn-del {
-      background: var(--danger);
+    .btn-primary {
+      background: var(--primary);
       color: #fff;
     }
 
-    .btn-save {
-      background: linear-gradient(135deg, #2563eb, #1d4ed8);
-      color: #fff;
-      font-size: 16px;
-      padding: 14px;
-      width: 100%;
-      margin-top: 16px;
+    /* ================== RULES SECTION ================== */
+    .rule-card {
+      background: #f8fafc;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 12px;
     }
 
-    .action-bar {
+    .rule-card.disabled {
+      opacity: 0.5;
+      background: #f1f5f9;
+    }
+
+    .rule-header {
       display: flex;
+      align-items: center;
       gap: 12px;
-      margin-top: 20px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
     }
 
-    .action-bar button {
-      flex: 1;
+    .rule-output {
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--primary);
+      min-width: 40px;
     }
 
+    .rule-logic-select {
+      width: 100px;
+      padding: 8px 12px;
+      font-weight: 600;
+    }
+
+    .rule-logic-select.logic-or {
+      border-color: var(--success);
+      background: #f0fdf4;
+    }
+
+    .rule-logic-select.logic-and {
+      border-color: var(--primary);
+      background: #eff6ff;
+    }
+
+    .rule-logic-select.logic-not {
+      border-color: var(--warning);
+      background: #fffbeb;
+    }
+
+    .rule-logic-select.logic-off {
+      border-color: var(--border);
+      background: #f9fafb;
+    }
+
+    .logic-description {
+      font-size: 12px;
+      color: var(--muted);
+      font-style: italic;
+    }
+
+    .input-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(60px, 1fr));
+      gap: 6px;
+      margin-top: 8px;
+    }
+
+    .input-checkbox {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 6px 8px;
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      cursor: pointer;
+      transition: all 0.15s;
+      font-size: 13px;
+    }
+
+    .input-checkbox:hover {
+      border-color: var(--primary);
+    }
+
+    .input-checkbox.checked {
+      background: var(--primary);
+      color: #fff;
+      border-color: var(--primary);
+    }
+
+    .input-checkbox.disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
+    .input-checkbox input {
+      width: auto;
+      margin: 0;
+      cursor: pointer;
+    }
+
+    .rule-warning {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 8px;
+      padding: 8px 12px;
+      background: #fef3c7;
+      border: 1px solid #f59e0b;
+      border-radius: 6px;
+      font-size: 12px;
+      color: #92400e;
+    }
+
+    .rule-summary {
+      margin-top: 10px;
+      padding: 8px 12px;
+      background: #e0f2fe;
+      border-radius: 6px;
+      font-size: 13px;
+      color: #0369a1;
+      font-family: monospace;
+    }
+
+    /* ================== ACTION PANEL ================== */
     .action-panel {
       position: sticky;
       bottom: 0;
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 14px;
       margin-top: 24px;
       padding: 16px;
       background: #f8fafc;
       border-top: 1px solid var(--border);
       z-index: 10;
+      display: flex;
+      justify-content: center;
     }
+
 
     .action-btn {
       height: 52px;
@@ -197,7 +275,13 @@
     .action-btn.primary {
       background: linear-gradient(135deg, #2563eb, #1d4ed8);
       color: #fff;
-    }
+      width: 100%;
+      max-width: 420px;
+      height: 56px;
+      font-size: 16px;
+      letter-spacing: 0.3px;
+    } 
+
 
     .action-btn.secondary {
       background: #374151;
@@ -206,6 +290,11 @@
 
     .action-btn:hover {
       opacity: 0.92;
+    }
+
+    .action-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
     }
 
     .spinner {
@@ -221,11 +310,7 @@
       to { transform: rotate(360deg); }
     }
 
-    .action-btn:disabled {
-      opacity: 0.7;
-      cursor: not-allowed;
-    }
-
+    /* ================== MODAL ================== */
     .modal-backdrop {
       position: fixed;
       inset: 0;
@@ -253,11 +338,6 @@
       margin-top: 16px;
     }
 
-    .action-btn:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
-    }
-
     #unsavedBadge {
       font-weight: 600;
     }
@@ -269,373 +349,546 @@
       margin-top: 30px;
       padding-bottom: 10px;
     }
+
+    /* ================== LEGEND ================== */
+    .logic-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      margin-bottom: 16px;
+      padding: 12px;
+      background: #fff;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+    }
+
+    .legend-badge {
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-weight: 600;
+      font-size: 11px;
+    }
+
+    .legend-badge.or { background: #dcfce7; color: #166534; }
+    .legend-badge.and { background: #dbeafe; color: #1e40af; }
+    .legend-badge.not { background: #fef3c7; color: #92400e; }
   </style>
 </head>
 
 <body>
+
 <header>
   <div>
-    <div class="title">IoT-Node Configuration Panel</div>
-    <div class="subtitle">
-      Local Setup • Access Point Mode
-      <span id="unsavedBadge" style="display:none; margin-left:8px; color:#fbbf24;">
-        ● Unsaved changes
-      </span>
+    <div class="title">IoT-Node BLE Configuration</div>
+    <div class="subtitle">Bluetooth Low Energy Setup</div>
+
+    <!-- STATUS BLE -->
+    <div id="bleStatus"
+         style="margin-top:6px;font-size:13px;font-weight:600;color:#dc2626;">
+      ● Disconnected
     </div>
+  </div>
+
+  <div>
+    <button id="btnConnect" class="btn btn-primary" onclick="connectBLE()">
+      Connect BLE
+    </button>
   </div>
 </header>
 
-<div id="modal" style="display:none;">
-  <div class="modal-backdrop"></div>
-  <div class="modal-box">
-    <h3 id="modalTitle"></h3>
-    <p id="modalMsg"></p>
-    <button class="btn primary" onclick="closeModal()">OK</button>
-  </div>
-</div>
 
 <div class="container">
 
-  <div class="card">
-    <h3>Basic Configuration</h3>
-    <div class="grid">
-      <div>
-        <label>Box ID</label>
-        <input type="number" id="boxID">
-      </div>
+<!-- BASIC -->
+<div class="card">
+<h3>Basic Configuration</h3>
+<div class="grid">
+  <div>
+    <label>Box ID</label>
+    <input type="number" id="boxID" min="1" max="99">
+  </div>
+</div>
+</div>
+
+<!-- RTC -->
+<div class="card">
+  <h3>Timestamp</h3>
+
+  <div class="grid">
+    <div>
+      <label>Date & Time</label>
+      <input type="datetime-local" id="rtcDatetime">
     </div>
   </div>
 
-  <div class="card">
-    <h3>Network Configuration</h3>
-
-    <div class="grid">
-      <div>
-        <label>Network Mode</label>
-        <select id="networkMode" onchange="onNetworkModeChange()">
-          <option value="wifi">WiFi Only</option>
-          <option value="ethernet">Ethernet Only</option>
-          <option value="hybrid">Hybrid (WiFi + Ethernet)</option>
-        </select>
-      </div>
-
-      <div id="priorityWrapper">
-        <label>Primary Network</label>
-        <select id="networkPriority">
-          <option value="ethernet">Ethernet</option>
-          <option value="wifi">WiFi</option>
-        </select>
-      </div>
-
-      <div id="wifiSSIDWrapper">
-        <label>WiFi SSID</label>
-        <input type="text" id="wifiSSID">
-      </div>
-
-      <div id="wifiPasswordWrapper">
-        <label>WiFi Password</label>
-        <div style="display:flex; gap:6px;">
-          <input type="password" id="wifiPassword" style="flex:1;">
-          <button class="btn" type="button" onclick="togglePassword()">👁</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="card">
-    <h3>Transport Configuration</h3>
-
-    <div class="grid">
-      <div>
-        <label>Protocol</label>
-        <select id="commMode" onchange="enforceCommNetworkRule()">
-          <option value="mqtt">MQTT</option>
-          <option value="httppost">HTTP POST</option>
-          <option value="tcp">TCP</option>
-          <option value="ws">WebSocket</option>
-        </select>
-      </div>
-
-      <div>
-        <label>Server Host</label>
-        <input type="text" id="serverIP">
-      </div>
-
-      <div>
-        <label>Port</label>
-        <input type="number" id="monitoringPort">
-      </div>
-
-      <div>
-        <label>Path</label>
-        <input type="text" id="serverPath">
-      </div>
-    </div>
-  </div>
-
-  <div class="card">
-    <h3>Rules</h3>
-    <button class="btn btn-add" onclick="addRule()">+ Add Rule</button>
-
-    <table>
-      <thead>
-        <tr>
-          <th>Trigger (Input)</th>
-          <th>Output</th>
-          <th>Action</th>
-        </tr>
-      </thead>
-      <tbody id="rulesTable"></tbody>
-    </table>
-  </div>
-
-  <hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;">
-
-  <div class="action-panel">
-    <button id="btnSave" class="action-btn primary" onclick="saveConfig()">
-      Save Configuration
+  <div style="margin-top:12px; display:flex; gap:10px; align-items:center;">
+    <button class="btn btn-primary" type="button" onclick="applyRTC()">
+      Apply Timestamp
     </button>
+    <span id="rtcStatus" class="logic-description"></span>
+  </div>
+</div>
 
-    <button class="action-btn secondary" onclick="downloadConfig()">
-      Download Config
-    </button>
+
+<!-- NETWORK -->
+<div class="card">
+  <h3>Network Configuration</h3>
+
+  <div class="grid">
+    <div>
+      <label>Network Mode</label>
+      <select id="networkMode" onchange="onNetworkModeChange()">
+        <option value="wifi">WiFi Only</option>
+        <option value="ethernet">Ethernet Only</option>
+        <option value="hybrid">Hybrid (WiFi + Ethernet)</option>
+      </select>
+    </div>
+
+    <div id="priorityWrapper" style="display:none;">
+      <label>Primary Network</label>
+      <select id="networkPriority">
+        <option value="ethernet">Ethernet</option>
+        <option value="wifi">WiFi</option>
+      </select>
+    </div>
+
+    <div id="wifiSSIDWrapper" style="display:none;">
+      <label>WiFi SSID</label>
+      <input type="text" id="wifiSSID">
+    </div>
+
+    <div id="wifiPasswordWrapper" style="display:none;">
+      <label>WiFi Password</label>
+      <div style="display:flex; gap:6px;">
+        <input type="password" id="wifiPassword" style="flex:1;">
+        <button class="btn" type="button" onclick="togglePassword()">👁</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+<!-- TRANSPORT -->
+<div class="card">
+  <h3>Transport Configuration</h3>
+  <div class="grid">
+    <div>
+      <label>Protocol</label>
+      <select id="commMode" onchange="enforceCommNetworkRule()">
+        <option value="mqtt">MQTT</option>
+        <option value="httppost">HTTP POST</option>
+        <option value="tcp">TCP</option>
+        <option value="ws">WebSocket</option>
+      </select>
+    </div>
+
+    <div>
+      <label>Server Host</label>
+      <input type="text" id="serverIP">
+    </div>
+
+    <div>
+      <label>Port</label>
+      <input type="number" id="monitoringPort">
+    </div>
+
+    <div>
+      <label>Path</label>
+      <input type="text" id="serverPath">
+    </div>
+  </div>
+</div>
+
+<!-- RULES -->
+<div class="card">
+  <h3>Output Rules (Logic Gates)</h3>
+  
+  <div class="logic-legend">
+    <div class="legend-item">
+      <span class="legend-badge or">OR</span>
+      <span>Output ON if <strong>ANY</strong> input is ON</span>
+    </div>
+    <div class="legend-item">
+      <span class="legend-badge and">AND</span>
+      <span>Output ON if <strong>ALL</strong> inputs are ON</span>
+    </div>
+    <div class="legend-item">
+      <span class="legend-badge not">NOT</span>
+      <span>Output ON if input is <strong>OFF</strong> (1 input only)</span>
+    </div>
   </div>
 
-  <footer>
-    IoT-Node Config UI • Local Web Interface
-  </footer>
+  <div id="rulesContainer">
+    <!-- Generated by JavaScript -->
+  </div>
+</div>
 
+<div class="action-panel">
+  <button class="action-btn primary" onclick="saveConfig()">
+    💾 Save Configuration
+  </button>
+</div>
+
+<footer>BLE Config Panel • IoT Node</footer>
 </div>
 
 <script>
-let rules = [];
-const ADMIN_PASSWORD = "password";
-let originalConfig = null;
-let isDirty = false;
+/* ================= BLE ================= */
+const SERVICE_UUID="4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+const CHAR_UUID="beb5483e-36e1-4688-b7f5-ea07361b26a8";
+const CHAR_UUID_RX="beb5483e-36e1-4688-b7f5-ea07361b26a8";
+const CHAR_UUID_TX="beb5483e-36e1-4688-b7f5-ea07361b26a9";
+let bleRxChar = null;
+let bleTxChar = null;
 
-function addRule(trigger = "I1", output = "Q1") {
-  rules.push({ trigger, output });
-  renderRules();
-  updateDirtyState();
-}
+async function connectBLE() {
+  try {
+    btnConnect.disabled = true;
+    bleStatus.textContent = "● Connecting...";
+    bleStatus.style.color = "#f59e0b";
 
-function deleteRule(index) {
-  rules.splice(index, 1);
-  renderRules();
-  updateDirtyState();
-}
-
-function renderRules() {
-  const tbody = document.getElementById("rulesTable");
-  tbody.innerHTML = "";
-
-  rules.forEach((r, i) => {
-    const tr = document.createElement("tr");
-
-    let inSel = "<select onchange='rules["+i+"].trigger=this.value'>";
-    for (let j=1;j<=15;j++) inSel += `<option ${r.trigger==="I"+j?"selected":""}>I${j}</option>`;
-    inSel += "</select>";
-
-    let outSel = "<select onchange='rules["+i+"].output=this.value'>";
-    for (let j=1;j<=4;j++) outSel += `<option ${r.output==="Q"+j?"selected":""}>Q${j}</option>`;
-    outSel += "</select>";
-
-    tr.innerHTML = `
-      <td>${inSel}</td>
-      <td>${outSel}</td>
-      <td><button class="btn btn-del" onclick="deleteRule(${i})">Delete</button></td>
-    `;
-    tbody.appendChild(tr);
-  });
-}
-
-function loadConfig() {
-  fetch("/config")
-    .then(r => r.json())
-    .then(cfg => {
-      document.getElementById("boxID").value =
-        cfg.device?.boxID ?? "";
-
-      document.getElementById("networkMode").value =
-        cfg.network?.mode ?? "wifi";
-
-      document.getElementById("networkPriority").value =
-        cfg.network?.priority ?? "ethernet";
-
-      onNetworkModeChange();
-
-      document.getElementById("commMode").value =
-        cfg.transport?.type ?? "mqtt";
-      
-      enforceCommNetworkRule();
-
-      document.getElementById("serverIP").value =
-        cfg.transport?.host ?? "";
-
-      document.getElementById("serverPath").value =
-        cfg.transport?.path ?? "";
-
-      document.getElementById("monitoringPort").value =
-        cfg.transport?.port ?? "";
-
-      document.getElementById("wifiSSID").value =
-        cfg.wifi?.ssid ?? "";
-
-      document.getElementById("wifiPassword").value =
-  cfg.wifi?.password ?? "";
-
-      rules = [];
-      if (cfg.rules) {
-        cfg.rules.forEach(r => {
-          const [i,o] = r.split("-");
-          rules.push({ trigger: i, output: o });
-        });
-      }
-      renderRules();
-      originalConfig = getCurrentConfig();
-      isDirty = false;
-      updateUIState();
-      attachChangeListeners();
+    const device = await navigator.bluetooth.requestDevice({
+      acceptAllDevices: true,
+      optionalServices: [SERVICE_UUID]
     });
-}
 
-function saveConfig() {
-  if (!requirePassword()) return;
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
 
-  const btn = document.getElementById("btnSave");
-  btn.disabled = true;
-  btn.innerHTML = `<div class="spinner"></div> Saving...`;
+    bleRxChar = await service.getCharacteristic(CHAR_UUID_RX);
+    bleTxChar = await service.getCharacteristic(CHAR_UUID_TX);
 
-  const cfg = getCurrentConfig();
+    bleTxChar.addEventListener("characteristicvaluechanged", onBleMessage);
+    await bleTxChar.startNotifications();
 
-  fetch("/save", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: "config=" + encodeURIComponent(JSON.stringify(cfg, null, 2))
-  })
-  .then(r => {
-    if (!r.ok) throw new Error();
-    return r.text();
-  })
-  .then(() => {
-    originalConfig = getCurrentConfig();
-    isDirty = false;
-    updateUIState();
-    showModal(
-      "Configuration Applied",
-      "Device is restarting to apply new settings. This page will disconnect."
-    );
-  })
-  .catch(() => showModal("Save Failed", "Unable to save configuration."))
-  .finally(() => {
-    btn.disabled = false;
-    btn.innerHTML = "Save Configuration";
-  });
-}
+    setBleStatus(true);
 
-function togglePassword() {
-  const pwd = document.getElementById("wifiPassword");
-  pwd.type = (pwd.type === "password") ? "text" : "password";
-}
+    getConfig();
 
-function downloadConfig() {
-  if (!requirePassword()) return;
-  window.location.href = "/download";
-}
-
-function requirePassword() {
-  const input = prompt("Enter admin password:");
-  if (input === null) return false;
-
-  if (input !== ADMIN_PASSWORD) {
-    showModal("Access Denied", "Invalid admin password.");
-    return false;
+  } catch (err) {
+    console.error(err);
+    alert("Failed to connect BLE");
+    setBleStatus(false);
   }
-  return true;
 }
 
-function showModal(title, msg) {
-  document.getElementById("modalTitle").innerText = title;
-  document.getElementById("modalMsg").innerText = msg;
-  document.getElementById("modal").style.display = "block";
+
+function onBleMessage(event) {
+  const value = new TextDecoder().decode(event.target.value);
+  console.log("[BLE RX]", value);
+
+  if (value.startsWith("CFG:")) {
+    const json = value.substring(4);
+    const cfg = JSON.parse(json);
+    applyConfigToUI(cfg);
+  }
 }
 
-function closeModal() {
-  document.getElementById("modal").style.display = "none";
+async function bleSend(txt){
+  if(!bleRxChar) {
+    alert("BLE not connected");
+    return;
+  }
+  await bleRxChar.writeValue(
+    new TextEncoder().encode(txt)
+  );
 }
 
-function getCurrentConfig() {
+/* ================= RULES ================= */
+/* ================== RULES ENGINE ================== */
+const NUM_INPUTS = 15;
+const NUM_OUTPUTS = 4;
+
+/*
+outputRules = {
+  Q1: { logic: "OR", inputs: ["I1","I2"] },
+  Q2: { logic: "OFF", inputs: [] },
+}
+*/
+let outputRules = {};
+
+/* ---------- INIT ---------- */
+function initRules() {
+  for (let q = 1; q <= NUM_OUTPUTS; q++) {
+    outputRules["Q" + q] = {
+      logic: "OFF",
+      inputs: []
+    };
+  }
+}
+
+/* ---------- RENDER ---------- */
+function renderRules() {
+  const container = document.getElementById("rulesContainer");
+  container.innerHTML = "";
+
+  for (let q = 1; q <= NUM_OUTPUTS; q++) {
+    const qKey = "Q" + q;
+    const rule = outputRules[qKey];
+
+    const card = document.createElement("div");
+    card.className = "rule-card" + (rule.logic === "OFF" ? " disabled" : "");
+    card.id = "ruleCard" + q;
+
+    /* ===== HEADER ===== */
+    let headerHtml = `
+      <div class="rule-header">
+        <span class="rule-output">${qKey}</span>
+
+        <select
+          id="logic${q}"
+          class="rule-logic-select logic-${rule.logic.toLowerCase()}"
+          onchange="onLogicChange(${q})">
+
+          <option value="OFF" ${rule.logic === "OFF" ? "selected" : ""}>OFF</option>
+          <option value="OR"  ${rule.logic === "OR"  ? "selected" : ""}>OR</option>
+          <option value="AND" ${rule.logic === "AND" ? "selected" : ""}>AND</option>
+          <option value="NOT" ${rule.logic === "NOT" ? "selected" : ""}>NOT</option>
+        </select>
+
+        <span class="logic-description">
+          ${getLogicDescription(rule.logic)}
+        </span>
+      </div>
+    `;
+
+    /* ===== INPUT GRID ===== */
+    let inputsHtml = `<div class="input-grid">`;
+
+    for (let i = 1; i <= NUM_INPUTS; i++) {
+      const iKey = "I" + i;
+      const checked = rule.inputs.includes(iKey);
+      const disabled =
+        rule.logic === "OFF" ||
+        (rule.logic === "NOT" && rule.inputs.length >= 1 && !checked);
+
+      inputsHtml += `
+        <label class="input-checkbox
+          ${checked ? "checked" : ""}
+          ${disabled ? "disabled" : ""}">
+
+          <input type="checkbox"
+            ${checked ? "checked" : ""}
+            ${disabled ? "disabled" : ""}
+            onchange="onInputToggle(${q}, ${i})">
+
+          ${iKey}
+        </label>
+      `;
+    }
+    inputsHtml += `</div>`;
+
+    /* ===== NOT WARNING ===== */
+    let warningHtml = "";
+    if (rule.logic === "NOT") {
+      warningHtml = `
+        <div class="rule-warning">
+          ⚠️ NOT logic allows only 1 input. Output will be ON when selected input is OFF.
+        </div>
+      `;
+    }
+
+    /* ===== SUMMARY ===== */
+    let summaryHtml = "";
+    if (rule.logic !== "OFF" && rule.inputs.length > 0) {
+      summaryHtml = `
+        <div class="rule-summary">
+          📋 ${qKey} = ${formatRuleSummary(rule)}
+        </div>
+      `;
+    }
+
+    card.innerHTML = headerHtml + inputsHtml + warningHtml + summaryHtml;
+    container.appendChild(card);
+  }
+}
+
+/* ---------- HANDLERS ---------- */
+function onLogicChange(q) {
+  const qKey = "Q" + q;
+  const select = document.getElementById("logic" + q);
+  const newLogic = select.value;
+
+  if (newLogic === "OFF") {
+    outputRules[qKey].inputs = [];
+  }
+
+  if (newLogic === "NOT" && outputRules[qKey].inputs.length > 1) {
+    outputRules[qKey].inputs = [outputRules[qKey].inputs[0]];
+  }
+
+  outputRules[qKey].logic = newLogic;
+  renderRules();
+}
+
+function onInputToggle(q, i) {
+  const qKey = "Q" + q;
+  const iKey = "I" + i;
+  const rule = outputRules[qKey];
+
+  if (rule.logic === "OFF") return;
+
+  if (rule.inputs.includes(iKey)) {
+    rule.inputs = rule.inputs.filter(x => x !== iKey);
+  } else {
+    if (rule.logic === "NOT") {
+      rule.inputs = [iKey];
+    } else {
+      rule.inputs.push(iKey);
+    }
+  }
+
+  rule.inputs.sort((a, b) => parseInt(a.slice(1)) - parseInt(b.slice(1)));
+  renderRules();
+}
+
+/* ---------- HELPERS ---------- */
+function getLogicDescription(logic) {
+  switch (logic) {
+    case "OR":  return "ON if any selected input is ON";
+    case "AND": return "ON if all selected inputs are ON";
+    case "NOT": return "ON if selected input is OFF";
+    default:    return "Output disabled";
+  }
+}
+
+function formatRuleSummary(rule) {
+  if (rule.logic === "NOT") {
+    return `NOT(${rule.inputs[0]})`;
+  }
+  return rule.inputs.join(` ${rule.logic} `);
+}
+
+function setLogic(q,v){outputRules["Q"+q].logic=v;renderRules()}
+function toggleInput(q,k){
+  const r=outputRules["Q"+q];
+  if(r.inputs.includes(k)) r.inputs=r.inputs.filter(x=>x!==k);
+  else r.logic=="NOT"?r.inputs=[k]:r.inputs.push(k);
+  renderRules();
+}
+
+/* ================= CONFIG ================= */
+function buildConfig(){
   return {
-    device: {
-      boxID: Number(document.getElementById("boxID").value)
+    device:{boxID:+boxID.value||0},
+    network:{
+      mode:networkMode.value,
+      priority:networkPriority.value
     },
-
-    network: {
-      mode: document.getElementById("networkMode").value,
-      priority: document.getElementById("networkPriority").value
+    transport:{
+      type:commMode.value,
+      host:serverIP.value,
+      port:+monitoringPort.value||0,
+      path:serverPath.value
     },
-
-    transport: {
-      type: document.getElementById("commMode").value,
-      host: document.getElementById("serverIP").value,
-      port: Number(document.getElementById("monitoringPort").value),
-      path: document.getElementById("serverPath").value
+    wifi:{
+      ssid:wifiSSID.value,
+      password:wifiPassword.value
     },
-
-    wifi: {
-      ssid: document.getElementById("wifiSSID").value,
-      password: document.getElementById("wifiPassword").value
-    },
-
-    rules: rules.map(r => `${r.trigger}-${r.output}`)
+    rules:Object.entries(outputRules)
+      .filter(([k,v])=>v.logic!="OFF"&&v.inputs.length)
+      .map(([k,v])=>`${k}:${v.logic}:${v.inputs.join(",")}`)
   };
 }
 
-function updateDirtyState() {
-  const current = JSON.stringify(getCurrentConfig());
-  const original = JSON.stringify(originalConfig);
+async function saveConfig(){
+  if (!bleRxChar) {
+    alert("BLE not connected");
+    return;
+  }
 
-  const dirtyNow = current !== original;
+  const btn = document.querySelector(".action-btn.primary");
+  btn.disabled = true;
+  btn.innerHTML = `<span class="spinner"></span> Saving...`;
 
-  if (dirtyNow !== isDirty) {
-    isDirty = dirtyNow;
-    updateUIState();
+  try {
+    await bleSend("CMD:CONFIG:" + JSON.stringify(buildConfig()));
+    btn.innerHTML = "✅ Saved";
+    setTimeout(() => {
+      btn.innerHTML = "💾 Save Config";
+      btn.disabled = false;
+    }, 1200);
+  } catch (e) {
+    alert("Failed to send config");
+    btn.innerHTML = "💾 Save Config";
+    btn.disabled = false;
   }
 }
 
-function updateUIState() {
-  const badge = document.getElementById("unsavedBadge");
-  const btnSave = document.getElementById("btnSave");
+async function applyRTC() {
+  const input = document.getElementById("rtcDatetime");
+  const status = document.getElementById("rtcStatus");
 
-  if (isDirty) {
-    badge.style.display = "inline";
-    btnSave.disabled = false;
-  } else {
-    badge.style.display = "none";
-    btnSave.disabled = true;
+  if (!input.value) {
+    status.textContent = "Please select date & time";
+    status.style.color = "#dc2626";
+    return;
+  }
+
+  // ubah "2025-05-20T12:34:56" → "2025-05-20 12:34:56"
+  const datetime = input.value.replace("T", " ");
+
+  status.textContent = "Sending timestamp...";
+  status.style.color = "#6b7280";
+
+  try {
+    await bleSend(`CMD:RTC:${datetime}`);
+
+    status.textContent = "Timestamp sent successfully";
+    status.style.color = "#16a34a";
+  } catch (e) {
+    status.textContent = "Failed to send timestamp";
+    status.style.color = "#dc2626";
   }
 }
 
-function attachChangeListeners() {
-  document.querySelectorAll("input, select").forEach(el => {
-    el.addEventListener("input", updateDirtyState);
-    el.addEventListener("change", updateDirtyState);
-  });
+function downloadConfig(){
+  const blob=new Blob([JSON.stringify(getConfig(),null,2)],{type:"application/json"});
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download="config.json";a.click();
 }
 
 function onNetworkModeChange() {
   const mode = document.getElementById("networkMode").value;
 
-  document.getElementById("priorityWrapper").style.display =
-    (mode === "hybrid") ? "block" : "none";
+  const priority = document.getElementById("priorityWrapper");
+  const ssid = document.getElementById("wifiSSIDWrapper");
+  const pwd = document.getElementById("wifiPasswordWrapper");
 
-  const wifiVisible = (mode === "wifi" || mode === "hybrid");
+  // Reset semua
+  priority.style.display = "none";
+  ssid.style.display = "none";
+  pwd.style.display = "none";
 
-  document.getElementById("wifiSSIDWrapper").style.display =
-    wifiVisible ? "block" : "none";
+  if (mode === "wifi") {
+    // WiFi Only
+    ssid.style.display = "block";
+    pwd.style.display = "block";
+  }
+  else if (mode === "hybrid") {
+    // Hybrid
+    priority.style.display = "block";
+    ssid.style.display = "block";
+    pwd.style.display = "block";
+  }
+  // ethernet only → semua hidden
+}
 
-  document.getElementById("wifiPasswordWrapper").style.display =
-    wifiVisible ? "block" : "none";
+function togglePassword() {
+  const pwdInput = document.getElementById("wifiPassword");
+  if (pwdInput.type === "password") {
+    pwdInput.type = "text";
+  } else {
+    pwdInput.type = "password";
+  }
 }
 
 function enforceCommNetworkRule() {
@@ -647,25 +900,112 @@ function enforceCommNetworkRule() {
   const hybOpt  = networkMode.querySelector('option[value="hybrid"]');
 
   if (commMode === "ws") {
-    // Paksa WiFi Only
+    // ===== WebSocket → WiFi ONLY =====
     networkMode.value = "wifi";
 
-    // Disable opsi lain
     ethOpt.disabled = true;
     hybOpt.disabled = true;
 
-    // Update tampilan
+    // pastikan UI network update
     onNetworkModeChange();
   } else {
-    // Bebaskan kembali
+    // ===== Protocol lain → semua mode boleh =====
     ethOpt.disabled = false;
     hybOpt.disabled = false;
   }
-
-  updateDirtyState();
 }
 
-loadConfig();
+function initRTCInput() {
+  const input = document.getElementById("rtcDatetime");
+  if (!input) return;
+
+  const now = new Date();
+
+  // format → YYYY-MM-DDTHH:MM:SS (required by datetime-local)
+  const pad = n => n.toString().padStart(2, "0");
+
+  const value =
+    now.getFullYear() + "-" +
+    pad(now.getMonth() + 1) + "-" +
+    pad(now.getDate()) + "T" +
+    pad(now.getHours()) + ":" +
+    pad(now.getMinutes()) + ":" +
+    pad(now.getSeconds());
+
+  input.value = value;
+}
+
+function applyConfigToUI(cfg) {
+  // BASIC
+  boxID.value = cfg.device?.boxID ?? "";
+
+  // NETWORK
+  networkMode.value = cfg.network?.mode ?? "wifi";
+  networkPriority.value = cfg.network?.priority ?? "ethernet";
+  onNetworkModeChange();
+
+  // WIFI
+  wifiSSID.value = cfg.wifi?.ssid ?? "";
+  wifiPassword.value = cfg.wifi?.password ?? "";
+
+  // TRANSPORT
+  commMode.value = cfg.transport?.type ?? "mqtt";
+  serverIP.value = cfg.transport?.host ?? "";
+  monitoringPort.value = cfg.transport?.port ?? "";
+  serverPath.value = cfg.transport?.path ?? "";
+
+  enforceCommNetworkRule();
+
+  // RULES
+  parseRulesArray(cfg.rules);
+  renderRules();
+
+  console.log("Config loaded from device");
+}
+
+function parseRulesArray(arr) {
+  initRules();
+  if (!Array.isArray(arr)) return;
+
+  arr.forEach(str => {
+    const [q, logic, inputs] = str.split(":");
+    if (!outputRules[q]) return;
+    outputRules[q].logic = logic;
+    outputRules[q].inputs = inputs ? inputs.split(",") : [];
+  });
+}
+
+async function getConfig() {
+  if (!bleRxChar) {
+    alert("BLE not connected");
+    return;
+  }
+
+  console.log("Requesting config from device...");
+  await bleSend("CMD:GET_CONFIG");
+}
+
+const bleStatus = document.getElementById("bleStatus");
+const btnConnect = document.getElementById("btnConnect");
+
+function setBleStatus(connected) {
+  if (connected) {
+    bleStatus.textContent = "● Connected";
+    bleStatus.style.color = "#16a34a";
+    btnConnect.disabled = true;
+  } else {
+    bleStatus.textContent = "● Disconnected";
+    bleStatus.style.color = "#dc2626";
+    btnConnect.disabled = false;
+  }
+}
+
+/* INIT */
+initRules();
+renderRules();
+onNetworkModeChange();
+enforceCommNetworkRule();
+initRTCInput();
 </script>
 </body>
 </html>

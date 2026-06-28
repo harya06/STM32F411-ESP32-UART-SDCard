@@ -99,6 +99,16 @@
 #define NET_CHECK_INTERVAL 10000
 #define SWITCH_COOLDOWN 10000
 
+// ================== LED STATUS (Manual Book ref. hal. 13-14) ==================
+// LED RUN  : blink lambat = init, ON tetap = normal, OFF = fatal/crash
+// LED ERROR: OFF = no error, 1 kedip = sensor, 2 kedip = comm, 3 kedip = network,
+//            ON tetap = fatal/system error
+#define LED_RUN_BLINK_INIT_MS     500U   // periode blink lambat saat init
+#define LED_ERR_BLINK_ON_MS       150U   // durasi tiap kedip ON
+#define LED_ERR_BLINK_OFF_MS      150U   // jeda antar kedip dalam 1 pattern
+#define LED_ERR_PATTERN_GAP_MS    1200U  // jeda sebelum pattern diulang
+#define STM_COMM_TIMEOUT_MS       8000U  // batas waktu tanpa frame valid dari STM32
+
 // ================== GLOBAL ==================
 BLECharacteristic* bleTxChar = nullptr;
 HardwareSerial SerialSTM(2);
@@ -121,6 +131,19 @@ bool errDHT = false;
 bool errADS = false;
 bool errSD = false;
 bool anyErrorActive = false;
+
+// ================== SYSTEM / LED STATUS ==================
+// errComm   : communication error -> gabungan UART timeout (STM32 diam)
+//             DAN comm-error TLV dari STM32 (jika modul melaporkannya)
+// errNet    : network error -> turunan dari netState / kondisi hybrid all-down
+// fatalErr  : system/fatal error -> ON tetap pada LED RUN (OFF) & LED ERROR (ON)
+bool sysReady       = false;   // true setelah boot/init selesai
+bool errCommTimeout = false;   // STM32 tidak kirim frame valid > STM_COMM_TIMEOUT_MS
+bool errCommTLV     = false;   // comm-error dilaporkan via TLV oleh STM32 (jika ada)
+bool errComm        = false;   // errCommTimeout || errCommTLV
+bool errNet         = false;   // diturunkan dari netState (lihat updateLedErrorFlags)
+bool fatalErr       = false;   // system/fatal error (LED RUN OFF, LED ERROR ON tetap)
+unsigned long lastStmFrameMs = 0;  // timestamp frame valid terakhir dari STM32
 
 // ================== NETWORK ==================
 byte mac[6];
@@ -198,6 +221,128 @@ const char* moduleToStr(uint8_t mid) {
     case MOD_ADS: return "ADS";
     case MOD_SD: return "SDCARD";
     default: return "UNKNOWN";
+  }
+}
+
+// ================== LED STATUS LOGIC ==================
+// Referensi: IoT Node Manual Book, bab "Indikator LED" (hal. 13-14).
+//
+// LED RUN
+//   - Blink lambat  -> sistem masih inisialisasi (sysReady == false)
+//   - ON tetap      -> sistem berjalan normal
+//   - OFF           -> firmware crash / fatal error (fatalErr == true)
+//
+// LED ERROR (semua non-blocking, berbasis millis(), tidak pernah delay())
+//   - OFF           -> tidak ada error
+//   - 1 kedip       -> sensor / peripheral error (RTC/DHT/ADS/SD)
+//   - 2 kedip       -> communication error (UART STM32 timeout atau TLV comm error)
+//   - 3 kedip       -> network error (netState == NET_DOWN setelah sempat UP)
+//   - ON tetap      -> system / fatal error (fatalErr == true), prioritas tertinggi
+//
+// Jika beberapa kondisi error aktif bersamaan, hanya pattern dengan prioritas
+// TERTINGGI yang ditampilkan (fatal > network > comm > sensor), supaya
+// operator selalu melihat masalah paling kritikal dahulu, sesuai contoh
+// "Diagnostik Cepat" pada manual book.
+
+// Kedip target untuk error non-fatal yang sedang aktif (0 = tidak ada)
+static uint8_t ledErrBlinksTarget = 0;
+
+void updateLedErrorFlags() {
+  // errComm: gabungan UART timeout (STM32 diam) DAN comm-error TLV dari STM32
+  if (!errCommTimeout && (millis() - lastStmFrameMs > STM_COMM_TIMEOUT_MS) && lastStmFrameMs != 0) {
+    errCommTimeout = true;
+    LOGW("[LED] STM32 comm timeout terdeteksi");
+  }
+  errComm = errCommTimeout || errCommTLV;
+
+  // errNet: diturunkan langsung dari netState, hanya relevan setelah sistem
+  // pernah online sekali (hindari LED ERROR nyala selama proses init normal)
+  errNet = sysReady && (netState == NET_DOWN);
+
+  // Tentukan pattern kedip aktif berdasarkan prioritas (fatal ditangani
+  // terpisah di updateStatusLeds karena bentuknya ON tetap, bukan kedip)
+  if (errNet) {
+    ledErrBlinksTarget = 3;
+  } else if (errComm) {
+    ledErrBlinksTarget = 2;
+  } else if (anyErrorActive) {
+    ledErrBlinksTarget = 1;
+  } else {
+    ledErrBlinksTarget = 0;
+  }
+}
+
+void updateStatusLeds() {
+  unsigned long now = millis();
+
+  // ---------- LED RUN ----------
+  if (fatalErr) {
+    digitalWrite(LED_RUN, LOW);   // OFF -> firmware crash / fatal error
+  } else if (!sysReady) {
+    // Blink lambat selama inisialisasi
+    static unsigned long lastToggle = 0;
+    static bool ledState = false;
+    if (now - lastToggle >= LED_RUN_BLINK_INIT_MS) {
+      lastToggle = now;
+      ledState = !ledState;
+      digitalWrite(LED_RUN, ledState ? HIGH : LOW);
+    }
+  } else {
+    digitalWrite(LED_RUN, HIGH);  // ON tetap -> sistem berjalan normal
+  }
+
+  // ---------- LED ERROR ----------
+  if (fatalErr) {
+    digitalWrite(LED_ERR, HIGH);  // ON tetap -> system / fatal error
+    return;
+  }
+
+  if (ledErrBlinksTarget == 0) {
+    digitalWrite(LED_ERR, LOW);   // OFF -> tidak ada error
+    return;
+  }
+
+  // State machine kedip non-blocking: ON -> OFF -> ON -> OFF ... lalu
+  // diam selama LED_ERR_PATTERN_GAP_MS sebelum pattern diulang dari awal.
+  static unsigned long lastStepMs = 0;
+  static uint8_t blinkStep = 0;     // berapa kali sudah ON
+  static bool errLedOn = false;
+  static uint8_t lastTarget = 0;
+
+  // Jika jumlah kedip target berubah (mis. dari 1 jadi 3), reset pattern
+  // supaya tidak nyangkut di tengah hitungan lama.
+  if (ledErrBlinksTarget != lastTarget) {
+    lastTarget = ledErrBlinksTarget;
+    blinkStep = 0;
+    errLedOn = false;
+    lastStepMs = now;
+    digitalWrite(LED_ERR, LOW);
+    return;
+  }
+
+  if (blinkStep >= ledErrBlinksTarget) {
+    // Sudah selesai N kedip, diam di gap sebelum mengulang
+    if (now - lastStepMs >= LED_ERR_PATTERN_GAP_MS) {
+      blinkStep = 0;
+      lastStepMs = now;
+    }
+    digitalWrite(LED_ERR, LOW);
+    return;
+  }
+
+  if (!errLedOn) {
+    if (now - lastStepMs >= LED_ERR_BLINK_OFF_MS) {
+      errLedOn = true;
+      lastStepMs = now;
+      digitalWrite(LED_ERR, HIGH);
+    }
+  } else {
+    if (now - lastStepMs >= LED_ERR_BLINK_ON_MS) {
+      errLedOn = false;
+      blinkStep++;
+      lastStepMs = now;
+      digitalWrite(LED_ERR, LOW);
+    }
   }
 }
 
@@ -410,6 +555,18 @@ bool loadConfig() {
   for (uint8_t i = 0; i < config.rules.count; i++) {
     LOGF("  rule[%d]=%s\n", i, config.rules.items[i]);
   }
+
+  // ===== VALIDASI KONSISTENSI transport vs network mode =====
+  // WebSocket cuma bisa jalan di mode wifi (lihat startWebSocket()
+  // yang sudah ada: if (!isMode("wifi")) return false). Kalau config
+  // tersimpan invalid (misal lewat jalur selain BLE UI), jangan
+  // gagal diam-diam - paksa ke wifi dan kasih tahu lewat log.
+  if (strcasecmp(config.transport.type.c_str(), "ws") == 0 &&
+      !isMode("wifi")) {
+    LOGE("[CFG] INVALID: transport=ws butuh network mode=wifi, dipaksa ke wifi");
+    config.network.mode = "wifi";
+  }
+
   initPriority();
   return true;
 }
@@ -432,6 +589,7 @@ bool startEthernet(uint32_t timeoutMs = ETH_LINK_TIMEOUT_MS) {
     if (link == LinkOFF) {
       LOGI("[NET] Ethernet link DOWN, waiting...");
     }
+    updateStatusLeds();   // tetap blink LED RUN selama boot menunggu link
     delay(500);
   }
   if (Ethernet.linkStatus() != LinkON) {
@@ -451,6 +609,7 @@ bool startEthernet(uint32_t timeoutMs = ETH_LINK_TIMEOUT_MS) {
       Serial.println(Ethernet.localIP());
       return true;
     }
+    updateStatusLeds();   // tetap blink LED RUN selama boot menunggu DHCP
     delay(ETH_DHCP_RETRY_MS);
   }
   LOGI("[NET] DHCP timeout");
@@ -462,6 +621,7 @@ bool tryEthernet() {
   if (startEthernet()) {
     netState = NET_UP;
     activeIf = IF_ETH;
+    sysReady = true;   // boot selesai -> LED RUN lanjut ON tetap
     LOGI("[NET] Ethernet READY");
     return true;
   }
@@ -481,6 +641,7 @@ bool startWiFiSTA(uint32_t timeoutMs = HEARTBEAT_MS) {
 
   uint32_t start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
+    updateStatusLeds();   // tetap blink LED RUN selama boot menunggu WiFi
     delay(500);
     LOG(".");
   }
@@ -500,6 +661,7 @@ bool tryWiFi() {
     netState = NET_UP;
     LOGI("[NET] WiFi READY");
     activeIf = IF_WIFI;
+    sysReady = true;   // boot selesai -> LED RUN lanjut ON tetap
     if (strcasecmp(config.transport.type.c_str(), "ws") == 0) {
       startWebSocket();
     }
@@ -788,6 +950,7 @@ bool mqttSendJSONWithSeq(uint32_t seq, const char* jsonLine) {
       LOGI("[MQTT] ACK OK");
       return true;
     }
+    delay(1);  // beri jatah CPU ke task lain (WiFi/BLE stack di FreeRTOS)
   }
   LOGI("[MQTT] ACK TIMEOUT");
   return false;
@@ -857,6 +1020,15 @@ void processFrame(uint8_t* buf, uint16_t len) {
     LOGE("[UART] CRC mismatch");
     return;
   }
+
+  // Frame valid (SOF + CRC OK) -> link UART ke STM32 dianggap hidup,
+  // dipakai untuk deteksi communication error (LED ERROR 2 kedip).
+  lastStmFrameMs = millis();
+  if (errCommTimeout) {
+    LOGI("[LED] comm timeout cleared, STM32 frame received");
+  }
+  errCommTimeout = false;
+  errComm = errCommTimeout || errCommTLV;
 
   uint8_t type = buf[1];
   uint16_t payloadLen = ((uint16_t)buf[2] << 8) | buf[3];
@@ -993,7 +1165,17 @@ void handleErrorFromSTM(uint8_t* tlv, size_t len) {
   if (moduleId == MOD_ADS) errADS = (status == ST_ERR);
   if (moduleId == MOD_SD) errSD = (status == ST_ERR);
 
+  // Modul selain RTC/DHT/ADS/SD (mis. modul comm RS485/UART STM32 di masa
+  // depan) dipetakan sebagai communication error pada LED ERROR (2 kedip),
+  // bukan sensor error. Saat ini STM32 belum mengirim moduleId semacam ini,
+  // jalur ini hanya menjaga agar siap dipakai tanpa perlu ubah LED logic lagi.
+  if (moduleId != MOD_RTC && moduleId != MOD_DHT &&
+      moduleId != MOD_ADS && moduleId != MOD_SD) {
+    errCommTLV = (status == ST_ERR);
+  }
+
   anyErrorActive = errRTC || errDHT || errADS || errSD;
+  errComm = errCommTimeout || errCommTLV;
   
   if (status == ST_ERR) {
     LOGF("[ERR] %s ERROR (code=%u)\n", modStr, errCode);
@@ -1340,7 +1522,12 @@ void initGPIO() {
 
   SerialSTM.begin(115200, SERIAL_8N1, RXD2, TXD2);
   pinMode(LED_RUN, OUTPUT);
-  digitalWrite(LED_RUN, HIGH);
+  pinMode(LED_ERR, OUTPUT);
+
+  // Mulai dari OFF; blink lambat untuk fase inisialisasi diteruskan secara
+  // non-blocking oleh updateStatusLeds() selama sysReady masih false.
+  digitalWrite(LED_RUN, LOW);
+  digitalWrite(LED_ERR, LOW);
 
   pinMode(BTN_PIN, INPUT_PULLUP);
   pinMode(PIN_CS_W5500, OUTPUT);
@@ -1353,15 +1540,6 @@ void initGPIO() {
 
   SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI);
   delay(100);
-
-  for (int i = 0; i < 5; i++) {
-    digitalWrite(LED_RUN, LOW);
-    delay(500);
-    digitalWrite(LED_RUN, HIGH);
-    delay(500);
-  }
-
-  digitalWrite(LED_RUN, LOW);
 }
 
 void initFS() {
@@ -1425,6 +1603,12 @@ void initNetwork() {
     LOGI("[CFG] unknown network mode");
   }
   LOGI("=== SETUP DONE ===");
+
+  // Inisialisasi selesai (terlepas dari hasil koneksi jaringan). Jika
+  // jaringan ternyata tidak berhasil, kondisi tersebut akan tertangkap
+  // sebagai network error (LED ERROR 3 kedip) lewat errNet, bukan membuat
+  // LED RUN blink inisialisasi selamanya.
+  sysReady = true;
 }
 
 void initBLE() {
@@ -1505,6 +1689,8 @@ void handleHybridNetwork() {
   // ================= ALL DOWN =================
   if (!wifiOk && !ethOk) {
     LOGE("[NET] all interfaces down → restart");
+    fatalErr = true;
+    updateStatusLeds();   // pastikan LED RUN OFF / LED ERROR ON tetap terlihat
     delay(5000);
     ESP.restart();
   }
@@ -1556,5 +1742,7 @@ void loop() {
   handleWebSocket();
   handleUART();
   handleBLE();
+  updateLedErrorFlags();
+  updateStatusLeds();
   yield();
 }
