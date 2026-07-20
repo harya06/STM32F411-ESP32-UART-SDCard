@@ -1,5 +1,6 @@
 // ================== INCLUDES ==================
 #include <Arduino.h>
+#include <esp_system.h>
 #include <ArduinoJson.h>
 #include <BLEDevice.h>
 #include <BLEUtils.h>
@@ -11,6 +12,48 @@
 #include <LittleFS.h>
 #include <WebSocketsClient.h>
 #include <WiFi.h>
+#include <Wire.h>
+
+
+enum NetIf {
+  IF_NONE,
+  IF_WIFI,
+  IF_ETH
+};
+
+enum GsmState {
+  GSM_NO_MODEM,          // belum ada modem terdeteksi di UART
+  GSM_MODEM_FOUND,       // UART merespons, modem baru ditemukan
+  GSM_POWER_ON,          // sequence power-on modem
+  GSM_AT_READY,          // modem merespons AT dasar
+  GSM_SIM_READY,         // SIM terdeteksi & siap (AT+CPIN)
+  GSM_REGISTER_NETWORK,  // registrasi jaringan seluler (AT+CREG/CGREG)
+  GSM_PDP_ACTIVE,        // PDP context aktif (data siap)
+  GSM_NETWORK_READY,     // jaringan data siap dipakai
+  GSM_READY,             // siap dipakai oleh sendByTransport()
+  GSM_NO_RESPONSE        // modem berhenti merespons
+};
+
+enum BleTransferState {
+  BLE_IDLE,
+  BLE_SEND_START,
+  BLE_SEND_HEADER,
+  BLE_SEND_DATA,
+  BLE_SEND_END
+};
+
+enum BleRxState {
+  BLE_RX_IDLE,
+  BLE_RX_HEADER,
+  BLE_RX_DATA
+};
+
+enum BLEState {
+  BLE_OFF,
+  BLE_STARTING,
+  BLE_RUNNING,
+  BLE_STOPPING
+};
 
 // ================== DEBUG ==================
 #define DEBUG 1
@@ -36,6 +79,15 @@
 #define BLE_SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define BLE_CHAR_UUID_RX "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 #define BLE_CHAR_UUID_TX "beb5483e-36e1-4688-b7f5-ea07361b26a9"
+#define BLE_CHUNK_SIZE 180
+
+// ---- BLE Transfer Protocol (S/H/D/E) ----
+constexpr size_t BLE_TX_PREFIX_RESERVE = 8;
+constexpr size_t BLE_TX_DATA_LEN = (BLE_CHUNK_SIZE > BLE_TX_PREFIX_RESERVE)
+                                     ? (BLE_CHUNK_SIZE - BLE_TX_PREFIX_RESERVE)
+                                     : 1;
+constexpr unsigned long BLE_TX_INTERVAL_MS = 15;
+constexpr unsigned long BLE_RX_TIMEOUT_MS = 5000;  // reset kalau transfer RX macet di tengah
 
 // ================== PIN CONFIG ==================
 #define PIN_MOSI 23
@@ -48,6 +100,28 @@
 #define TXD2 17
 #define LED_RUN 33
 #define LED_ERR 25
+#define LED_ACTIVE_LOW 1
+
+inline void ledWrite(uint8_t pin, bool on) {
+#if LED_ACTIVE_LOW
+  digitalWrite(pin, on ? LOW : HIGH);
+#else
+  digitalWrite(pin, on ? HIGH : LOW);
+#endif
+}
+
+// ---- GSM (SIMCom A7670) UART pins (custom, add-on module) ----
+#define PIN_GSM_RX 26
+#define PIN_GSM_TX 27
+
+// ---- Addon Ekspansi Input (PCF8574) I2C pins ----
+#define PIN_ADDON_SDA 26
+#define PIN_ADDON_SCL 27
+#define PCF8574_ADDR 0x20
+
+// ================== ADDON: EKSPANSI INPUT (PCF8574) ==================
+#define ADDON_POLL_INTERVAL_MS 200
+#define ADDON_DEBOUNCE_MS 500 
 
 // ================== STM32 FRAME ==================
 #define SOF_BYTE 0x7E
@@ -57,13 +131,16 @@
 
 // ===== UART DATA =====
 #define MAX_RULES 10
-#define MAX_RULE_LEN 16
+#define MAX_RULE_LEN 32
 #define TYPE_DATA 0x01
 #define TYPE_ACK 0x02
 #define TYPE_RULES 0x03
 #define TYPE_RTC 0x04
+#define TYPE_ADDON 0x06
 #define TAG_RULE 0x10
 #define TAG_RTC_TS 0x20
+#define TAG_ADDON_MASK 0x40
+#define NUM_INPUTS_TOTAL 19
 
 // ===== ERR TLV TAG =====
 #define TAG_ERR_MID 0x30
@@ -99,18 +176,55 @@
 #define NET_CHECK_INTERVAL 10000
 #define SWITCH_COOLDOWN 10000
 
+// ---- GSM: state machine modem (probe/negosiasi/health-check) ----
+#define GSM_UART_BAUD 9600
+#define GSM_PROBE_INTERVAL_MS 3000          // interval cek modem saat NO_MODEM
+#define GSM_STEP_INTERVAL_MS 2000           // jeda antar percobaan step negosiasi
+#define GSM_MAX_STEP_FAILS 5                // gagal berturut2 saat negosiasi -> anggap modem lepas
+#define GSM_HEALTH_CHECK_INTERVAL_MS 15000  // interval health-check saat READY
+#define GSM_MAX_HEALTH_FAILS 3              // gagal health-check berturut2 -> anggap modem lepas
+
+// ---- GSM: AT command engine (gsmSendAT/gsmWaitFor) ----
+#define GSM_AT_RESP_MAX 256
+#define GSM_AT_DEFAULT_TIMEOUT_MS 300
+#define GSM_AT_MATCH_GRACE_MS 150
+
+// ---- GSM: transport TCP (AT+CIPOPEN/CIPSEND/CIPCLOSE) ----
+#define GSM_CIPOPEN_TIMEOUT_MS 10000
+#define GSM_CIPSEND_PROMPT_TIMEOUT_MS 3000
+#define GSM_CIPSEND_CONFIRM_TIMEOUT_MS 5000
+
+// ---- GSM: transport HTTP (AT+HTTPINIT/PARA/DATA/ACTION/READ) ----
+#define GSM_HTTP_INIT_TIMEOUT_MS 5000
+#define GSM_HTTP_PARA_TIMEOUT_MS 2000
+#define GSM_HTTP_DATA_PROMPT_TIMEOUT_MS 3000
+#define GSM_HTTP_DATA_CONFIRM_TIMEOUT_MS 5000
+#define GSM_HTTP_ACTION_TIMEOUT_MS 15000  // POST bisa lama, tergantung jaringan
+#define GSM_HTTP_READ_TIMEOUT_MS 5000
+
+// ---- GSM: transport MQTT (AT+CMQTTSTART/ACCQ/CONNECT/PUB/SUB/DISC/STOP) ----
+#define GSM_MQTT_CLIENT_IDX 0
+#define GSM_MQTT_START_TIMEOUT_MS 5000
+#define GSM_MQTT_ACCQ_TIMEOUT_MS 2000
+#define GSM_MQTT_CONNECT_TIMEOUT_MS 10000
+#define GSM_MQTT_SUB_TIMEOUT_MS 5000
+#define GSM_MQTT_PUB_TIMEOUT_MS 5000
+#define GSM_MQTT_TOPIC_PROMPT_TIMEOUT_MS 2000
+#define GSM_MQTT_PAYLOAD_PROMPT_TIMEOUT_MS 2000
+
 // ================== LED STATUS (Manual Book ref. hal. 13-14) ==================
-// LED RUN  : blink lambat = init, ON tetap = normal, OFF = fatal/crash
-// LED ERROR: OFF = no error, 1 kedip = sensor, 2 kedip = comm, 3 kedip = network,
-//            ON tetap = fatal/system error
-#define LED_RUN_BLINK_INIT_MS     500U   // periode blink lambat saat init
-#define LED_ERR_BLINK_ON_MS       150U   // durasi tiap kedip ON
-#define LED_ERR_BLINK_OFF_MS      150U   // jeda antar kedip dalam 1 pattern
-#define LED_ERR_PATTERN_GAP_MS    1200U  // jeda sebelum pattern diulang
-#define STM_COMM_TIMEOUT_MS       8000U  // batas waktu tanpa frame valid dari STM32
+#define LED_RUN_BLINK_INIT_MS 500U    // periode blink lambat saat init
+#define LED_ERR_BLINK_ON_MS 150U      // durasi tiap kedip ON
+#define LED_ERR_BLINK_OFF_MS 150U     // jeda antar kedip dalam 1 pattern
+#define LED_ERR_PATTERN_GAP_MS 1200U  // jeda sebelum pattern diulang
+#define STM_COMM_TIMEOUT_MS 8000U     // batas waktu tanpa frame valid dari STM32
 
 // ================== GLOBAL ==================
 BLECharacteristic* bleTxChar = nullptr;
+BLEServer* bleServer = nullptr;
+BLEService* bleGattService = nullptr;
+BLECharacteristic* bleRxChar = nullptr;
+BLEState bleState = BLE_OFF;
 HardwareSerial SerialSTM(2);
 PubSubClient mqttClient;
 WebSocketsClient ws;
@@ -123,7 +237,7 @@ unsigned long btnPressStart = 0;
 unsigned long lastNetCheck = 0;
 bool longActionDone = false;
 bool wsConnected = false;
-volatile bool needRestart = false;
+volatile bool needRestart = false;  // set setelah SAVE CONFIG sukses via BLE → ESP.restart() di loop()
 volatile bool wsAckOk = false;
 volatile uint32_t wsAckSeq = 0;
 bool errRTC = false;
@@ -132,18 +246,37 @@ bool errADS = false;
 bool errSD = false;
 bool anyErrorActive = false;
 
+struct BleTransfer {
+  BleTransferState state = BLE_IDLE;
+  String buffer;
+  uint16_t crc = 0;
+  size_t size = 0;
+  uint16_t chunk = 0;
+  uint16_t totalChunk = 0;
+  unsigned long timer = 0;
+};
+BleTransfer bleTx;
+
+struct BleRxTransfer {
+  BleRxState state = BLE_RX_IDLE;
+  String buffer;
+  size_t expectedSize = 0;
+  uint16_t expectedCrc = 0;
+  uint16_t expectedTotalChunk = 0;
+  uint16_t receivedChunk = 0;
+  unsigned long lastActivity = 0;
+};
+BleRxTransfer bleRx;
+
 // ================== SYSTEM / LED STATUS ==================
-// errComm   : communication error -> gabungan UART timeout (STM32 diam)
-//             DAN comm-error TLV dari STM32 (jika modul melaporkannya)
-// errNet    : network error -> turunan dari netState / kondisi hybrid all-down
-// fatalErr  : system/fatal error -> ON tetap pada LED RUN (OFF) & LED ERROR (ON)
-bool sysReady       = false;   // true setelah boot/init selesai
-bool errCommTimeout = false;   // STM32 tidak kirim frame valid > STM_COMM_TIMEOUT_MS
-bool errCommTLV     = false;   // comm-error dilaporkan via TLV oleh STM32 (jika ada)
-bool errComm        = false;   // errCommTimeout || errCommTLV
-bool errNet         = false;   // diturunkan dari netState (lihat updateLedErrorFlags)
-bool fatalErr       = false;   // system/fatal error (LED RUN OFF, LED ERROR ON tetap)
-unsigned long lastStmFrameMs = 0;  // timestamp frame valid terakhir dari STM32
+bool sysReady = false;
+bool errCommTimeout = false;
+bool errCommTLV = false;
+bool errComm = false;
+bool errNet = false;
+bool fatalErr = false;
+unsigned long lastStmFrameMs = 0;
+static uint8_t ledErrBlinksTarget = 0;
 
 // ================== NETWORK ==================
 byte mac[6];
@@ -152,14 +285,25 @@ enum NetState {
   NET_UP
 };
 NetState netState = NET_DOWN;
-enum NetIf {
-  IF_NONE,
-  IF_WIFI,
-  IF_ETH
-};
-
 NetIf activeIf = IF_NONE;
 NetIf priorityIf = IF_WIFI;
+
+// ================== GSM (SIMCom A7670) ==================
+HardwareSerial SerialGSM(1);
+GsmState gsmState = GSM_NO_MODEM;
+unsigned long gsmLastProbe = 0;
+unsigned long gsmLastStateChange = 0;
+uint8_t gsmFailCount = 0;        // gagal berturut2 di state negosiasi saat ini
+uint8_t gsmHealthFailCount = 0;  // gagal berturut2 health-check saat READY
+bool gsmMqttStarted = false;     // AT+CMQTTSTART sudah dijalankan (service aktif)
+bool gsmMqttConnected = false;   // client sudah ACCQ+CONNECT+SUB ke broker
+
+// ================== ADDON: EKSPANSI INPUT (PCF8574) ==================
+uint8_t addonInputMask = 0;      // nilai stabil (sudah lolos debounce), ini yg dikirim ke STM32
+uint8_t addonRawMaskLast = 0;    // raw hasil poll I2C terakhir, dipakai buat deteksi perubahan
+unsigned long addonLastPoll = 0;
+unsigned long addonLastChangeMs = 0;  // kapan terakhir raw mask berubah
+bool addonMaskSentOnce = false;
 
 // ================== TIMERS ==================
 static unsigned long lastSwitch = 0;
@@ -198,9 +342,17 @@ struct WifiConfig {
   String password;
 };
 
+struct GsmConfig {
+  String apn;
+};
+
 struct RulesConfig {
   uint8_t count;
   char items[MAX_RULES][MAX_RULE_LEN];
+};
+
+struct AddonConfig {
+  String type;
 };
 
 struct AppConfig {
@@ -208,7 +360,9 @@ struct AppConfig {
   NetworkConfig network;
   TransportConfig transport;
   WifiConfig wifi;
+  GsmConfig gsm;
   RulesConfig rules;
+  AddonConfig addon;
 };
 
 AppConfig config;
@@ -225,42 +379,14 @@ const char* moduleToStr(uint8_t mid) {
 }
 
 // ================== LED STATUS LOGIC ==================
-// Referensi: IoT Node Manual Book, bab "Indikator LED" (hal. 13-14).
-//
-// LED RUN
-//   - Blink lambat  -> sistem masih inisialisasi (sysReady == false)
-//   - ON tetap      -> sistem berjalan normal
-//   - OFF           -> firmware crash / fatal error (fatalErr == true)
-//
-// LED ERROR (semua non-blocking, berbasis millis(), tidak pernah delay())
-//   - OFF           -> tidak ada error
-//   - 1 kedip       -> sensor / peripheral error (RTC/DHT/ADS/SD)
-//   - 2 kedip       -> communication error (UART STM32 timeout atau TLV comm error)
-//   - 3 kedip       -> network error (netState == NET_DOWN setelah sempat UP)
-//   - ON tetap      -> system / fatal error (fatalErr == true), prioritas tertinggi
-//
-// Jika beberapa kondisi error aktif bersamaan, hanya pattern dengan prioritas
-// TERTINGGI yang ditampilkan (fatal > network > comm > sensor), supaya
-// operator selalu melihat masalah paling kritikal dahulu, sesuai contoh
-// "Diagnostik Cepat" pada manual book.
-
-// Kedip target untuk error non-fatal yang sedang aktif (0 = tidak ada)
-static uint8_t ledErrBlinksTarget = 0;
-
 void updateLedErrorFlags() {
-  // errComm: gabungan UART timeout (STM32 diam) DAN comm-error TLV dari STM32
   if (!errCommTimeout && (millis() - lastStmFrameMs > STM_COMM_TIMEOUT_MS) && lastStmFrameMs != 0) {
     errCommTimeout = true;
     LOGW("[LED] STM32 comm timeout terdeteksi");
   }
   errComm = errCommTimeout || errCommTLV;
-
-  // errNet: diturunkan langsung dari netState, hanya relevan setelah sistem
-  // pernah online sekali (hindari LED ERROR nyala selama proses init normal)
   errNet = sysReady && (netState == NET_DOWN);
 
-  // Tentukan pattern kedip aktif berdasarkan prioritas (fatal ditangani
-  // terpisah di updateStatusLeds karena bentuknya ON tetap, bukan kedip)
   if (errNet) {
     ledErrBlinksTarget = 3;
   } else if (errComm) {
@@ -277,56 +403,50 @@ void updateStatusLeds() {
 
   // ---------- LED RUN ----------
   if (fatalErr) {
-    digitalWrite(LED_RUN, LOW);   // OFF -> firmware crash / fatal error
+    ledWrite(LED_RUN, false);
   } else if (!sysReady) {
-    // Blink lambat selama inisialisasi
     static unsigned long lastToggle = 0;
     static bool ledState = false;
     if (now - lastToggle >= LED_RUN_BLINK_INIT_MS) {
       lastToggle = now;
       ledState = !ledState;
-      digitalWrite(LED_RUN, ledState ? HIGH : LOW);
+      ledWrite(LED_RUN, ledState);
     }
   } else {
-    digitalWrite(LED_RUN, HIGH);  // ON tetap -> sistem berjalan normal
+    ledWrite(LED_RUN, true);
   }
 
   // ---------- LED ERROR ----------
   if (fatalErr) {
-    digitalWrite(LED_ERR, HIGH);  // ON tetap -> system / fatal error
+    ledWrite(LED_ERR, true);
     return;
   }
 
   if (ledErrBlinksTarget == 0) {
-    digitalWrite(LED_ERR, LOW);   // OFF -> tidak ada error
+    ledWrite(LED_ERR, false);
     return;
   }
 
-  // State machine kedip non-blocking: ON -> OFF -> ON -> OFF ... lalu
-  // diam selama LED_ERR_PATTERN_GAP_MS sebelum pattern diulang dari awal.
   static unsigned long lastStepMs = 0;
-  static uint8_t blinkStep = 0;     // berapa kali sudah ON
+  static uint8_t blinkStep = 0;
   static bool errLedOn = false;
   static uint8_t lastTarget = 0;
 
-  // Jika jumlah kedip target berubah (mis. dari 1 jadi 3), reset pattern
-  // supaya tidak nyangkut di tengah hitungan lama.
   if (ledErrBlinksTarget != lastTarget) {
     lastTarget = ledErrBlinksTarget;
     blinkStep = 0;
     errLedOn = false;
     lastStepMs = now;
-    digitalWrite(LED_ERR, LOW);
+    ledWrite(LED_ERR, false);
     return;
   }
 
   if (blinkStep >= ledErrBlinksTarget) {
-    // Sudah selesai N kedip, diam di gap sebelum mengulang
     if (now - lastStepMs >= LED_ERR_PATTERN_GAP_MS) {
       blinkStep = 0;
       lastStepMs = now;
     }
-    digitalWrite(LED_ERR, LOW);
+    ledWrite(LED_ERR, false);
     return;
   }
 
@@ -334,14 +454,14 @@ void updateStatusLeds() {
     if (now - lastStepMs >= LED_ERR_BLINK_OFF_MS) {
       errLedOn = true;
       lastStepMs = now;
-      digitalWrite(LED_ERR, HIGH);
+      ledWrite(LED_ERR, true);
     }
   } else {
     if (now - lastStepMs >= LED_ERR_BLINK_ON_MS) {
       errLedOn = false;
       blinkStep++;
       lastStepMs = now;
-      digitalWrite(LED_ERR, LOW);
+      ledWrite(LED_ERR, false);
     }
   }
 }
@@ -354,8 +474,128 @@ static inline uint32_t rd32(const uint8_t* p) {
   return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
 }
 
+uint16_t crc16(const uint8_t* data, size_t len) {
+  uint16_t crc = 0xFFFF;
+
+  while (len--) {
+    crc ^= *data++;
+
+    for (uint8_t i = 0; i < 8; i++) {
+      if (crc & 1)
+        crc = (crc >> 1) ^ 0xA001;
+      else
+        crc >>= 1;
+    }
+  }
+
+  return crc;
+}
+
+// ================== BLE TRANSFER MODULE (S/H/D/E) ==================
+bool bleTransferBusy() {
+  return bleTx.state != BLE_IDLE;
+}
+
+void bleTransferReset() {
+  bleTx.state = BLE_IDLE;
+  bleTx.buffer = String();
+  bleTx.crc = 0;
+  bleTx.size = 0;
+  bleTx.chunk = 0;
+  bleTx.totalChunk = 0;
+}
+
+void bleTransferBegin(const String& json) {
+  bleTx.buffer = json;
+  bleTx.size = json.length();
+  bleTx.crc = crc16((const uint8_t*)bleTx.buffer.c_str(), bleTx.size);
+  bleTx.chunk = 0;
+  bleTx.totalChunk = (bleTx.size + BLE_TX_DATA_LEN - 1) / BLE_TX_DATA_LEN;
+  if (bleTx.totalChunk == 0) bleTx.totalChunk = 1;
+  bleTx.timer = millis();
+  bleTx.state = BLE_SEND_START;
+}
+
+void bleTransferTask() {
+  if (bleTx.state == BLE_IDLE) return;
+
+  if (!bleClientConnected || bleTxChar == nullptr) {
+    LOGW("[BLE-TX] Client disconnected / characteristic invalid, transfer dibatalkan");
+    bleTransferReset();
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - bleTx.timer < BLE_TX_INTERVAL_MS) return;
+  bleTx.timer = now;
+
+  char pkt[BLE_CHUNK_SIZE + 16];
+
+  switch (bleTx.state) {
+
+    case BLE_SEND_START:
+      {
+        const char* s = "S";
+        bleTxChar->setValue((uint8_t*)s, 1);
+        bleTxChar->notify();
+        LOGI("[BLE-TX] Transfer Started");
+        bleTx.state = BLE_SEND_HEADER;
+        delay(20);
+        break;
+      }
+
+    case BLE_SEND_HEADER:
+      {
+        int n = snprintf(pkt, sizeof(pkt), "H|%u|%04X|%u",
+                         (unsigned)bleTx.size, bleTx.crc, (unsigned)bleTx.totalChunk);
+        bleTxChar->setValue((uint8_t*)pkt, n);
+        bleTxChar->notify();
+        LOGI(String("[BLE-TX] Header Sent: ") + pkt);
+        bleTx.state = BLE_SEND_DATA;
+        delay(20);
+        break;
+      }
+
+    case BLE_SEND_DATA:
+      {
+        size_t offset = (size_t)bleTx.chunk * BLE_TX_DATA_LEN;
+        size_t remain = (offset < bleTx.size) ? (bleTx.size - offset) : 0;
+        size_t len = (remain < BLE_TX_DATA_LEN) ? remain : BLE_TX_DATA_LEN;
+
+        int n = snprintf(pkt, sizeof(pkt), "D|%u|%.*s",
+                         (unsigned)(bleTx.chunk + 1), (int)len, bleTx.buffer.c_str() + offset);
+        bleTxChar->setValue((uint8_t*)pkt, n);
+        bleTxChar->notify();
+
+        bleTx.chunk++;
+        LOGI("[BLE-TX] Chunk " + String(bleTx.chunk) + "/" + String(bleTx.totalChunk));
+        delay(100);
+
+        if (bleTx.chunk >= bleTx.totalChunk) {
+          bleTx.state = BLE_SEND_END;
+        }
+        break;
+      }
+
+    case BLE_SEND_END:
+      {
+        const char* e = "E";
+        bleTxChar->setValue((uint8_t*)e, 1);
+        bleTxChar->notify();
+        LOGI("[BLE-TX] Transfer Finished");
+        bleTransferReset();
+        delay(20);
+        break;
+      }
+
+    default:
+      bleTransferReset();
+      break;
+  }
+}
+
 bool saveConfigFromBLE(const String& json) {
-  StaticJsonDocument<1024> doc;
+  StaticJsonDocument<2048> doc;
   if (deserializeJson(doc, json)) {
     LOGE("[CFG] invalid JSON from BLE");
     return false;
@@ -372,62 +612,200 @@ bool saveConfigFromBLE(const String& json) {
 
   LOGI("[CFG] config.json updated via BLE");
 
-  needRestart = true;
   return true;
+}
+
+// ================== BLE RX MODULE (S/H/D/E) ==================
+void bleRxReset() {
+  bleRx.state = BLE_RX_IDLE;
+  bleRx.buffer = String();
+  bleRx.expectedSize = 0;
+  bleRx.expectedCrc = 0;
+  bleRx.expectedTotalChunk = 0;
+  bleRx.receivedChunk = 0;
+}
+
+void bleRxTimeoutCheck() {
+  if (bleRx.state == BLE_RX_IDLE) return;
+  if (millis() - bleRx.lastActivity > BLE_RX_TIMEOUT_MS) {
+    LOGW("[BLE-RX] Transfer timeout, buffer direset");
+    bleRxReset();
+  }
+}
+
+void handleBleCommand(const String& cmd) {
+  if (cmd == "CMD:GET_CONFIG") {
+    // ---- Guard: BLE Client Connected ----
+    if (!bleClientConnected) {
+      LOGW("[BLE] GET_CONFIG ditolak: tidak ada client terkoneksi");
+      return;
+    }
+    // ---- Guard: Characteristic Valid ----
+    if (bleTxChar == nullptr) {
+      LOGE("[BLE] GET_CONFIG ditolak: TX characteristic belum siap");
+      return;
+    }
+    // ---- Guard: Transfer Busy ----
+    if (bleTransferBusy()) {
+      LOGW("[BLE] GET_CONFIG ditolak: transfer sebelumnya masih berjalan (Transfer Busy)");
+      return;
+    }
+
+    if (!LittleFS.exists("/config.json")) {
+      Serial.println("[BLE] config.json not found");
+      return;
+    }
+
+    File f = LittleFS.open("/config.json", "r");
+    if (!f) {
+      Serial.println("[BLE] failed to open config.json");
+      return;
+    }
+
+    StaticJsonDocument<2048> doc;
+    DeserializationError err = deserializeJson(doc, f);
+    f.close();
+
+    if (err) {
+      LOGE("[BLE] config.json parse error, kirim mentah tanpa status GSM");
+      File f2 = LittleFS.open("/config.json", "r");
+      String raw = f2.readString();
+      f2.close();
+
+      bleTransferBegin(raw);
+      LOGI("[BLE] Config transfer started (raw fallback)");
+      return;
+    }
+    doc["gsmAttached"] = (gsmState != GSM_NO_MODEM);
+
+    String json;
+    serializeJson(doc, json);
+
+    bleTransferBegin(json);
+
+    LOGI("[BLE] Config transfer started");
+  } else if (cmd.startsWith("CMD:CONFIG:")) {
+    String json = cmd.substring(strlen("CMD:CONFIG:"));
+
+    bool ok = saveConfigFromBLE(json);
+
+    if (bleTxChar) {
+      String resp = ok ? "SAVED:OK" : "SAVED:FAIL:invalid_json";
+      bleTxChar->setValue(resp.c_str());
+      bleTxChar->notify();
+    }
+
+    if (ok) {
+      LOGI("[BLE] Config Saved");
+
+      needRestart = true;
+    } else {
+      LOGE("[BLE] config save failed");
+    }
+  } else if (cmd.startsWith("CMD:RTC:")) {
+    String datetime = cmd.substring(strlen("CMD:RTC:"));
+    uint32_t epoch = parseDateTimeToEpoch(datetime);
+    if (epoch > 0) {
+      sendRTCToSTM32(epoch);
+      LOGI("[BLE] RTC sent to STM");
+    }
+  } else {
+    Serial.println("[BLE] Unknown command");
+  }
 }
 
 class BleRxCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* pChar) override {
 
-    String cmd = pChar->getValue();
-
-    if (cmd.length() == 0) return;
+    String raw = pChar->getValue();
+    if (raw.length() == 0) return;
 
     Serial.print("[BLE RX] ");
-    Serial.println(cmd);
+    Serial.println(raw);
 
-    if (cmd == "CMD:GET_CONFIG") {
-      if (!LittleFS.exists("/config.json")) {
-        Serial.println("[BLE] config.json not found");
-        return;
-      }
-
-      File f = LittleFS.open("/config.json", "r");
-      if (!f) {
-        Serial.println("[BLE] failed to open config.json");
-        return;
-      }
-
-      String json = f.readString();
-      f.close();
-
-      String resp = "CFG:" + json;
-
-      if (bleTxChar) {
-        bleTxChar->setValue(resp.c_str());
-        bleTxChar->notify();
-
-        LOGI("[BLE] CFG sent to client");
-      } else {
-        LOGE("[BLE] TX characteristic not ready");
-      }
-    } else if (cmd.startsWith("CMD:CONFIG:")) {
-      String json = cmd.substring(strlen("CMD:CONFIG:"));
-      if (saveConfigFromBLE(json)) {
-        LOGI("[BLE] config saved & applied");
-      } else {
-        LOGE("[BLE] config save failed");
-      }
-    } else if (cmd.startsWith("CMD:RTC:")) {
-      String datetime = cmd.substring(strlen("CMD:RTC:"));
-      uint32_t epoch = parseDateTimeToEpoch(datetime);
-      if (epoch > 0) {
-        sendRTCToSTM32(epoch);
-        LOGI("[BLE] RTC sent to STM");
-      }
-    } else {
-      Serial.println("[BLE] Unknown command");
+    // ---- Framed protocol (S/H/D/E) untuk payload panjang, mirror dari BLE-TX ----
+    if (raw == "S") {
+      bleRxReset();
+      bleRx.state = BLE_RX_HEADER;
+      bleRx.lastActivity = millis();
+      LOGI("[BLE-RX] Transfer Started");
+      return;
     }
+
+    if (raw.startsWith("H|")) {
+      if (bleRx.state != BLE_RX_HEADER) {
+        LOGW("[BLE-RX] Header diterima tanpa Start, diabaikan");
+        return;
+      }
+      // format: H|<size>|<crcHex>|<totalChunk>
+      int p1 = raw.indexOf('|', 2);
+      int p2 = (p1 > 0) ? raw.indexOf('|', p1 + 1) : -1;
+      if (p1 < 0 || p2 < 0) {
+        LOGE("[BLE-RX] Header format invalid");
+        bleRxReset();
+        return;
+      }
+      bleRx.expectedSize = (size_t)raw.substring(2, p1).toInt();
+      bleRx.expectedCrc = (uint16_t)strtoul(raw.substring(p1 + 1, p2).c_str(), nullptr, 16);
+      bleRx.expectedTotalChunk = (uint16_t)raw.substring(p2 + 1).toInt();
+      bleRx.buffer = String();
+      bleRx.buffer.reserve(bleRx.expectedSize + 1);
+      bleRx.receivedChunk = 0;
+      bleRx.state = BLE_RX_DATA;
+      bleRx.lastActivity = millis();
+      LOGI("[BLE-RX] Header: size=" + String((unsigned)bleRx.expectedSize) + " crc=" + String(bleRx.expectedCrc, HEX) + " totalChunk=" + String(bleRx.expectedTotalChunk));
+      return;
+    }
+
+    if (raw.startsWith("D|")) {
+      if (bleRx.state != BLE_RX_DATA) {
+        LOGW("[BLE-RX] Chunk diterima tanpa Header, diabaikan");
+        return;
+      }
+      int p1 = raw.indexOf('|', 2);
+      if (p1 < 0) {
+        LOGE("[BLE-RX] Chunk format invalid");
+        return;
+      }
+      uint16_t chunkNum = (uint16_t)raw.substring(2, p1).toInt();
+      String data = raw.substring(p1 + 1);
+      bleRx.buffer += data;
+      bleRx.receivedChunk = chunkNum;
+      bleRx.lastActivity = millis();
+      LOGI("[BLE-RX] Chunk " + String(chunkNum) + "/" + String(bleRx.expectedTotalChunk));
+      return;
+    }
+
+    if (raw == "E") {
+      if (bleRx.state != BLE_RX_DATA) {
+        LOGW("[BLE-RX] End diterima tanpa transfer aktif, diabaikan");
+        bleRxReset();
+        return;
+      }
+
+      bool sizeOk = (bleRx.buffer.length() == bleRx.expectedSize);
+      uint16_t actualCrc = crc16((const uint8_t*)bleRx.buffer.c_str(), bleRx.buffer.length());
+      bool crcOk = (actualCrc == bleRx.expectedCrc);
+
+      if (!sizeOk || !crcOk) {
+        LOGE("[BLE-RX] Transfer gagal (size " + String((unsigned)bleRx.buffer.length()) + "/" + String((unsigned)bleRx.expectedSize) + ", crc " + String(actualCrc, HEX) + "/" + String(bleRx.expectedCrc, HEX) + ")");
+        if (bleTxChar) {
+          bleTxChar->setValue("RXFAIL:crc_or_size");
+          bleTxChar->notify();
+        }
+        bleRxReset();
+        return;
+      }
+
+      LOGI("[BLE-RX] Transfer selesai, " + String((unsigned)bleRx.buffer.length()) + " byte diterima utuh");
+      String completeCmd = bleRx.buffer;
+      bleRxReset();
+      handleBleCommand(completeCmd);
+      return;
+    }
+
+    // ---- Legacy: command pendek tanpa framing (muat dalam 1 paket BLE) ----
+    handleBleCommand(raw);
   }
 };
 
@@ -441,13 +819,27 @@ class BleServerCallbacks : public BLEServerCallbacks {
     bleClientConnected = false;
     LOGI("[BLE] client disconnected");
 
-    BLEDevice::getAdvertising()->start();
-    LOGI("[BLE] advertising restarted");
+    if (bleTransferBusy()) {
+      LOGW("[BLE-TX] client disconnect di tengah transfer, transfer dibatalkan");
+      bleTransferReset();
+    }
+
+    if (bleState == BLE_RUNNING) {
+      BLEDevice::getAdvertising()->start();
+      LOGI("[BLE] advertising restarted");
+    }
   }
 };
 
+static BleServerCallbacks bleServerCallbacksInstance;
+static BleRxCallbacks bleRxCallbacksInstance;
+
 bool isMode(const char* m) {
   return strcasecmp(config.network.mode.c_str(), m) == 0;
+}
+
+bool isAddon(const char* t) {
+  return strcasecmp(config.addon.type.c_str(), t) == 0;
 }
 
 Client* getNetClient() {
@@ -461,12 +853,18 @@ Client* getNetClient() {
     return &ethClient;
   }
 
+  if (isMode("hybrid")) {
+    static WiFiClient hybridWifiClient;
+    static EthernetClient hybridEthClient;
+    if (activeIf == IF_WIFI) return &hybridWifiClient;
+    if (activeIf == IF_ETH) return &hybridEthClient;
+    return nullptr;
+  }
+
   return nullptr;
 }
 
-// =====================================================
 // =================== FILE HELPERS ====================
-// =====================================================
 String readFile(const char* path) {
   File f = LittleFS.open(path, FILE_READ);
   if (!f) return "";
@@ -494,7 +892,7 @@ bool loadConfig() {
     return false;
   }
 
-  StaticJsonDocument<1024> doc;
+  StaticJsonDocument<2048> doc;
   DeserializationError err = deserializeJson(doc, f);
   f.close();
 
@@ -532,6 +930,17 @@ bool loadConfig() {
   config.wifi.password =
     doc["wifi"]["password"] | "";
 
+  config.wifi.ssid.trim();
+  config.wifi.password.trim();
+
+  // ---------------- GSM (opsional, add-on) ----------------
+  config.gsm.apn =
+    doc["gsm"]["apn"] | "";
+
+  // ---------------- ADDON  ----------------
+  config.addon.type =
+    doc["addon"]["type"] | "none";
+
   // ---------------- RULES ----------------
   config.rules.count = 0;
 
@@ -557,13 +966,18 @@ bool loadConfig() {
   }
 
   // ===== VALIDASI KONSISTENSI transport vs network mode =====
-  // WebSocket cuma bisa jalan di mode wifi (lihat startWebSocket()
-  // yang sudah ada: if (!isMode("wifi")) return false). Kalau config
-  // tersimpan invalid (misal lewat jalur selain BLE UI), jangan
-  // gagal diam-diam - paksa ke wifi dan kasih tahu lewat log.
-  if (strcasecmp(config.transport.type.c_str(), "ws") == 0 &&
-      !isMode("wifi")) {
+  if (isMode("gsm") && strcasecmp(config.transport.type.c_str(), "ws") == 0) {
+    LOGE("[CFG] INVALID: GSM tidak mendukung WebSocket, transport dipaksa ke tcp");
+    config.transport.type = "tcp";
+  }
+
+  if (strcasecmp(config.transport.type.c_str(), "ws") == 0 && !isMode("wifi")) {
     LOGE("[CFG] INVALID: transport=ws butuh network mode=wifi, dipaksa ke wifi");
+    config.network.mode = "wifi";
+  }
+
+  if (isMode("gsm") && !isAddon("gsm")) {
+    LOGE("[CFG] INVALID: network mode=gsm tapi addon.type bukan gsm, network mode dipaksa ke wifi");
     config.network.mode = "wifi";
   }
 
@@ -571,9 +985,7 @@ bool loadConfig() {
   return true;
 }
 
-// =====================================================
 // =================== NET HELPERS =====================
-// =====================================================
 bool startEthernet(uint32_t timeoutMs = ETH_LINK_TIMEOUT_MS) {
   Ethernet.init(PIN_CS_W5500);
 
@@ -589,7 +1001,7 @@ bool startEthernet(uint32_t timeoutMs = ETH_LINK_TIMEOUT_MS) {
     if (link == LinkOFF) {
       LOGI("[NET] Ethernet link DOWN, waiting...");
     }
-    updateStatusLeds();   // tetap blink LED RUN selama boot menunggu link
+    updateStatusLeds();
     delay(500);
   }
   if (Ethernet.linkStatus() != LinkON) {
@@ -609,7 +1021,7 @@ bool startEthernet(uint32_t timeoutMs = ETH_LINK_TIMEOUT_MS) {
       Serial.println(Ethernet.localIP());
       return true;
     }
-    updateStatusLeds();   // tetap blink LED RUN selama boot menunggu DHCP
+    updateStatusLeds();
     delay(ETH_DHCP_RETRY_MS);
   }
   LOGI("[NET] DHCP timeout");
@@ -621,7 +1033,7 @@ bool tryEthernet() {
   if (startEthernet()) {
     netState = NET_UP;
     activeIf = IF_ETH;
-    sysReady = true;   // boot selesai -> LED RUN lanjut ON tetap
+    sysReady = true;
     LOGI("[NET] Ethernet READY");
     return true;
   }
@@ -629,29 +1041,126 @@ bool tryEthernet() {
   return false;
 }
 
+void printSSIDHex(const String& ssid) {
+  LOGN("========== SSID DEBUG ==========");
+  LOGF("SSID      : <%s>\n", ssid.c_str());
+  LOGF("Length    : %d\n", ssid.length());
+
+  LOG("HEX       : ");
+
+  for (size_t i = 0; i < ssid.length(); i++) {
+    LOGF("%02X ", (uint8_t)ssid[i]);
+  }
+
+  LOGN("");
+  LOGN("===============================");
+}
+
+void scanWifiList() {
+  LOGI("Scanning WiFi...");
+
+  WiFi.mode(WIFI_STA);
+  delay(500);
+
+  WiFi.disconnect(true, true);
+  delay(1000);
+
+  int n = WiFi.scanNetworks(false, false);
+
+  if (n == WIFI_SCAN_FAILED) {
+    LOGE("Scan failed");
+    return;
+  }
+
+  LOGF("[INFO ] %d AP ditemukan\n", n);
+
+  for (int i = 0; i < n; i++) {
+    LOGF("[%02d] %-32s RSSI:%4d CH:%2d ENC:%d\n",
+         i,
+         WiFi.SSID(i).c_str(),
+         WiFi.RSSI(i),
+         WiFi.channel(i),
+         WiFi.encryptionType(i));
+
+    if (WiFi.SSID(i) == config.wifi.ssid) {
+      LOGI(">>> TARGET SSID DITEMUKAN <<<");
+    }
+  }
+
+  WiFi.scanDelete();
+}
+
 bool startWiFiSTA(uint32_t timeoutMs = HEARTBEAT_MS) {
-  if (config.wifi.ssid.length() == 0) {
-    LOGW("[WIFI] SSID empty");
+
+  config.wifi.ssid.trim();
+  config.wifi.password.trim();
+
+  if (config.wifi.ssid.isEmpty()) {
+    LOGE("SSID kosong");
     return false;
   }
-  LOGF("[WIFI] connecting to %s...\n", config.wifi.ssid.c_str());
+
+  printSSIDHex(config.wifi.ssid);
+
+  scanWifiList();
+
+  LOGI("Reset WiFi Driver");
+
+  WiFi.disconnect(true, true);
+  delay(300);
+
   WiFi.mode(WIFI_STA);
+  delay(300);
+
+  LOGF("[INFO ] Connecting to <%s>\n",
+       config.wifi.ssid.c_str());
+
   WiFi.begin(config.wifi.ssid.c_str(),
              config.wifi.password.c_str());
 
   uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
-    updateStatusLeds();   // tetap blink LED RUN selama boot menunggu WiFi
+  wl_status_t lastStatus = WL_IDLE_STATUS;
+
+  while (millis() - start < timeoutMs) {
+    wl_status_t status = WiFi.status();
+
+    if (status != lastStatus) {
+      lastStatus = status;
+
+      LOGF("[DEBUG] WiFi Status = %d\n", status);
+    }
+
+    if (status == WL_CONNECTED) {
+      break;
+    }
+
+    updateStatusLeds();
     delay(500);
+
     LOG(".");
   }
+
+  LOGN("");
+
   if (WiFi.status() == WL_CONNECTED) {
-    LOG("[WIFI] connected, IP: ");
-    LOGI(WiFi.localIP());
+    LOGI("WiFi Connected");
+
+    LOGF("SSID      : %s\n", WiFi.SSID().c_str());
+    LOGF("IP        : %s\n", WiFi.localIP().toString().c_str());
+    LOGF("Gateway   : %s\n", WiFi.gatewayIP().toString().c_str());
+    LOGF("Subnet    : %s\n", WiFi.subnetMask().toString().c_str());
+    LOGF("DNS       : %s\n", WiFi.dnsIP().toString().c_str());
+    LOGF("RSSI      : %d dBm\n", WiFi.RSSI());
+    LOGF("Channel   : %d\n", WiFi.channel());
+    LOGF("BSSID     : %s\n", WiFi.BSSIDstr().c_str());
+
     return true;
   }
-  LOGI("[WIFI] connect timeout");
-  WiFi.disconnect(true);
+
+  LOGE("WiFi Connection Failed");
+
+  WiFi.disconnect(true, true);
+
   return false;
 }
 
@@ -661,7 +1170,7 @@ bool tryWiFi() {
     netState = NET_UP;
     LOGI("[NET] WiFi READY");
     activeIf = IF_WIFI;
-    sysReady = true;   // boot selesai -> LED RUN lanjut ON tetap
+    sysReady = true;
     if (strcasecmp(config.transport.type.c_str(), "ws") == 0) {
       startWebSocket();
     }
@@ -682,7 +1191,7 @@ bool startWebSocket() {
     config.transport.port,
     config.transport.path.c_str());
   ws.onEvent(wsEvent);
-  ws.setReconnectInterval(SENDWAIT_INTERVAL_MS);  // auto reconnect
+  ws.setReconnectInterval(SENDWAIT_INTERVAL_MS);
   ws.enableHeartbeat(HEARTBEAT_MS, ACK_TIMEOUT_MS, 2);
   return true;
 }
@@ -742,9 +1251,602 @@ void markSwitched() {
   lastSwitch = millis();
 }
 
-// =====================================================
+// ================ GSM (SIMCom A7670) =================
+void gsmFlushRx() {
+  while (SerialGSM.available()) {
+    SerialGSM.read();
+  }
+}
+
+bool gsmSendAT(const char* cmd, const char* expect,
+               uint32_t timeoutMs = GSM_AT_DEFAULT_TIMEOUT_MS,
+               char* respBuf = nullptr, size_t respBufLen = 0) {
+  gsmFlushRx();
+
+  SerialGSM.print(cmd);
+  SerialGSM.print("\r\n");
+
+  String resp;
+  resp.reserve(GSM_AT_RESP_MAX);
+
+  unsigned long start = millis();
+  bool found = false;
+  bool gotError = false;
+  unsigned long foundAt = 0;
+
+  while (millis() - start < timeoutMs) {
+    while (SerialGSM.available()) {
+      char c = (char)SerialGSM.read();
+      resp += c;
+      if (resp.length() > GSM_AT_RESP_MAX) {
+        resp.remove(0, resp.length() - GSM_AT_RESP_MAX);
+      }
+      if (!found && expect != nullptr && expect[0] != '\0' && resp.indexOf(expect) != -1) {
+        found = true;
+        foundAt = millis();
+      }
+      if (resp.indexOf("ERROR") != -1) {
+        gotError = true;
+      }
+    }
+    if (gotError) break;
+
+    if (found && (millis() - foundAt >= GSM_AT_MATCH_GRACE_MS)) break;
+    yield();
+  }
+
+  if (respBuf != nullptr && respBufLen > 0) {
+    size_t n = resp.length();
+    if (n >= respBufLen) n = respBufLen - 1;
+    memcpy(respBuf, resp.c_str(), n);
+    respBuf[n] = '\0';
+  }
+
+  LOGF("[GSM][AT] TX: %s\n", cmd);
+  LOGF("[GSM][AT] RX: %s\n", resp.c_str());
+
+  return found;
+}
+
+bool gsmWaitFor(const char* expect, uint32_t timeoutMs,
+                char* respBuf = nullptr, size_t respBufLen = 0) {
+  String resp;
+  resp.reserve(GSM_AT_RESP_MAX);
+
+  unsigned long start = millis();
+  bool found = false;
+
+  while (millis() - start < timeoutMs) {
+    while (SerialGSM.available()) {
+      char c = (char)SerialGSM.read();
+      resp += c;
+      if (resp.length() > GSM_AT_RESP_MAX) {
+        resp.remove(0, resp.length() - GSM_AT_RESP_MAX);
+      }
+      if (expect != nullptr && expect[0] != '\0' && resp.indexOf(expect) != -1) {
+        found = true;
+      }
+    }
+    if (found) break;
+    yield();
+  }
+
+  if (respBuf != nullptr && respBufLen > 0) {
+    size_t n = resp.length();
+    if (n >= respBufLen) n = respBufLen - 1;
+    memcpy(respBuf, resp.c_str(), n);
+    respBuf[n] = '\0';
+  }
+  return found;
+}
+
+const char* gsmStateToStr(GsmState s) {
+  switch (s) {
+    case GSM_NO_MODEM: return "NO_MODEM";
+    case GSM_MODEM_FOUND: return "MODEM_FOUND";
+    case GSM_POWER_ON: return "POWER_ON";
+    case GSM_AT_READY: return "AT_READY";
+    case GSM_SIM_READY: return "SIM_READY";
+    case GSM_REGISTER_NETWORK: return "REGISTER_NETWORK";
+    case GSM_PDP_ACTIVE: return "PDP_ACTIVE";
+    case GSM_NETWORK_READY: return "NETWORK_READY";
+    case GSM_READY: return "READY";
+    case GSM_NO_RESPONSE: return "NO_RESPONSE";
+    default: return "UNKNOWN";
+  }
+}
+
+void gsmSetState(GsmState newState) {
+  if (newState == gsmState) return;
+  LOGI("[GSM] " + String(gsmStateToStr(gsmState)) + " -> " + String(gsmStateToStr(newState)));
+  GsmState oldState = gsmState;
+  gsmState = newState;
+  gsmLastStateChange = millis();
+  gsmLastProbe = 0;
+  gsmFailCount = 0;
+  gsmHealthFailCount = 0;
+
+  if (newState == GSM_READY) {
+    netState = NET_UP;
+  } else if (oldState == GSM_READY) {
+    netState = NET_DOWN;
+  }
+
+  if (newState == GSM_NO_MODEM) {
+    gsmMqttStarted = false;
+    gsmMqttConnected = false;
+  }
+}
+
+bool gsmIsReady() {
+  return gsmState == GSM_READY;
+}
+
+void gsmInit() {
+  LOGI("[GSM] Initializing...");
+  SerialGSM.begin(GSM_UART_BAUD, SERIAL_8N1, PIN_GSM_RX, PIN_GSM_TX);
+  gsmSetState(GSM_NO_MODEM);
+  gsmLastProbe = 0;
+}
+
+// ============ GSM: DETEKSI MODEM ) ============
+void gsmDetectLoop() {
+  unsigned long now = millis();
+
+  if (gsmState == GSM_NO_MODEM) {
+    if (now - gsmLastProbe >= GSM_PROBE_INTERVAL_MS) {
+      gsmLastProbe = now;
+      LOGI("[GSM] Waiting Modem...");
+      if (gsmSendAT("AT", "OK")) {
+        gsmSetState(GSM_MODEM_FOUND);
+      }
+    }
+  }
+}
+
+// ============ GSM: NEGOSIASI JARINGAN) ============
+void gsmNetworkLoop() {
+  unsigned long now = millis();
+
+  if (gsmState != GSM_NO_MODEM && gsmState != GSM_READY && gsmState != GSM_NO_RESPONSE && gsmFailCount >= GSM_MAX_STEP_FAILS) {
+    gsmSetState(GSM_NO_RESPONSE);
+  }
+
+  switch (gsmState) {
+    case GSM_NO_MODEM:
+      break;
+
+    case GSM_MODEM_FOUND:
+      if (now - gsmLastProbe >= GSM_STEP_INTERVAL_MS) {
+        gsmLastProbe = now;
+        if (gsmSendAT("ATE0", "OK")) {
+          gsmSetState(GSM_POWER_ON);
+        } else {
+          gsmFailCount++;
+        }
+      }
+      break;
+
+    case GSM_POWER_ON:
+      if (now - gsmLastProbe >= GSM_STEP_INTERVAL_MS) {
+        gsmLastProbe = now;
+        if (gsmSendAT("AT", "OK")) {
+          LOGI("[GSM] AT Ready");
+          gsmSetState(GSM_AT_READY);
+        } else {
+          gsmFailCount++;
+        }
+      }
+      break;
+
+    case GSM_AT_READY:
+      if (now - gsmLastProbe >= GSM_STEP_INTERVAL_MS) {
+        gsmLastProbe = now;
+        char resp[GSM_AT_RESP_MAX];
+        if (gsmSendAT("AT+CPIN?", "+CPIN:", 1000, resp, sizeof(resp)) && strstr(resp, "READY") != nullptr) {
+          LOGI("[GSM] SIM Ready");
+          gsmSetState(GSM_SIM_READY);
+        } else {
+          gsmFailCount++;
+          LOGW("[GSM] SIM belum siap...");
+        }
+      }
+      break;
+
+    case GSM_SIM_READY:
+      gsmSetState(GSM_REGISTER_NETWORK);
+      break;
+
+    case GSM_REGISTER_NETWORK:
+      if (now - gsmLastProbe >= GSM_STEP_INTERVAL_MS) {
+        gsmLastProbe = now;
+        char resp[GSM_AT_RESP_MAX];
+
+        if (gsmSendAT("AT+CREG?", "+CREG:", 1000, resp, sizeof(resp)) && (strstr(resp, ",1") != nullptr || strstr(resp, ",5") != nullptr)) {
+          LOGI("[GSM] Registered");
+          gsmSetState(GSM_PDP_ACTIVE);
+        } else {
+          gsmFailCount++;
+          LOGW("[GSM] Belum register ke jaringan seluler...");
+        }
+      }
+      break;
+
+    case GSM_PDP_ACTIVE:
+      if (now - gsmLastProbe >= GSM_STEP_INTERVAL_MS) {
+        gsmLastProbe = now;
+        LOGI("[GSM] Opening PDP");
+        bool apnOk = true;
+        if (config.gsm.apn.length() > 0) {
+          char cmd[96];
+          snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", config.gsm.apn.c_str());
+          apnOk = gsmSendAT(cmd, "OK", 1000);
+        }
+        if (apnOk && gsmSendAT("AT+CGACT=1,1", "OK", 5000)) {
+          gsmSetState(GSM_NETWORK_READY);
+        } else {
+          gsmFailCount++;
+          LOGW("[GSM] PDP context gagal diaktifkan...");
+        }
+      }
+      break;
+
+    case GSM_NETWORK_READY:
+      if (now - gsmLastProbe >= GSM_STEP_INTERVAL_MS) {
+        gsmLastProbe = now;
+        char resp[GSM_AT_RESP_MAX];
+        if (gsmSendAT("AT+CGPADDR=1", "+CGPADDR:", 1000, resp, sizeof(resp))) {
+          LOGI("[GSM] Network Ready");
+          gsmSetState(GSM_READY);
+        } else {
+          gsmFailCount++;
+        }
+      }
+      break;
+
+    case GSM_READY:
+      if (now - gsmLastProbe >= GSM_HEALTH_CHECK_INTERVAL_MS) {
+        gsmLastProbe = now;
+        if (gsmSendAT("AT", "OK", 500)) {
+          gsmHealthFailCount = 0;
+        } else {
+          gsmHealthFailCount++;
+          LOGW("[GSM] health-check gagal (" + String(gsmHealthFailCount) + "/" + String(GSM_MAX_HEALTH_FAILS) + ")");
+          if (gsmHealthFailCount >= GSM_MAX_HEALTH_FAILS) {
+            gsmSetState(GSM_NO_RESPONSE);
+          }
+        }
+      }
+      break;
+
+    case GSM_NO_RESPONSE:
+      LOGW("[GSM] Modem Removed");
+      gsmSetState(GSM_NO_MODEM);
+      break;
+  }
+}
+
+// ============ GSM: TCP TRANSPORT (AT+CIPOPEN/CIPSEND/CIPCLOSE) ============
+bool gsmTcpSendJSONWithSeq(uint32_t seq, const char* jsonLine) {
+  char cmd[160];
+
+  gsmSendAT("AT+CIPCLOSE=0", "OK", 2000);
+
+  LOG("[GSM][TCP] connect ");
+  LOG(config.transport.host);
+  LOG(":");
+  LOGI(config.transport.port);
+
+  snprintf(cmd, sizeof(cmd), "AT+CIPOPEN=0,\"TCP\",\"%s\",%u",
+           config.transport.host.c_str(), config.transport.port);
+  if (!gsmSendAT(cmd, "+CIPOPEN: 0,0", GSM_CIPOPEN_TIMEOUT_MS)) {
+    LOGW("[GSM][TCP] connect FAIL");
+    return false;
+  }
+  LOGI("[GSM] TCP Connected");
+
+  String frame = String((unsigned)strlen(jsonLine)) + "\n" + String(jsonLine);
+
+  snprintf(cmd, sizeof(cmd), "AT+CIPSEND=0,%u", (unsigned)frame.length());
+  gsmFlushRx();
+  SerialGSM.print(cmd);
+  SerialGSM.print("\r\n");
+
+  if (!gsmWaitFor(">", GSM_CIPSEND_PROMPT_TIMEOUT_MS)) {
+    LOGW("[GSM][TCP] send prompt timeout");
+    gsmSendAT("AT+CIPCLOSE=0", "OK", 2000);
+    return false;
+  }
+
+  SerialGSM.write((const uint8_t*)frame.c_str(), frame.length());
+
+  if (!gsmWaitFor("OK", GSM_CIPSEND_CONFIRM_TIMEOUT_MS)) {
+    LOGW("[GSM][TCP] send FAIL");
+    gsmSendAT("AT+CIPCLOSE=0", "OK", 2000);
+    return false;
+  }
+
+  LOG("[GSM][TCP] sent len=");
+  LOGI(frame.length());
+
+  char ackResp[GSM_AT_RESP_MAX];
+  bool haveData = gsmWaitFor("}", ACK_TIMEOUT_MS, ackResp, sizeof(ackResp));
+
+  gsmSendAT("AT+CIPCLOSE=0", "OK", 2000);
+  LOGI("[GSM] TCP Closed");
+
+  if (!haveData) {
+    LOGW("[GSM][TCP] no response");
+    return false;
+  }
+
+  char* jsonStart = strchr(ackResp, '{');
+  if (!jsonStart) {
+    LOGW("[GSM][TCP] no JSON in response");
+    return false;
+  }
+  return parseAck(jsonStart, seq);
+}
+
+// ============ GSM: HTTP TRANSPORT (AT+HTTPINIT/PARA/DATA/ACTION/READ) ============
+bool gsmHttpSendJSONWithSeq(uint32_t seq, const char* jsonLine) {
+  char cmd[256];
+
+  gsmSendAT("AT+HTTPTERM", "OK", 2000);
+
+  if (!gsmSendAT("AT+HTTPINIT", "OK", GSM_HTTP_INIT_TIMEOUT_MS)) {
+    LOGW("[GSM][HTTP] init FAIL");
+    return false;
+  }
+
+  gsmSendAT("AT+HTTPPARA=\"CID\",1", "OK", GSM_HTTP_PARA_TIMEOUT_MS);
+
+  String url = "http://" + config.transport.host + ":" + String(config.transport.port) + config.transport.path;
+  snprintf(cmd, sizeof(cmd), "AT+HTTPPARA=\"URL\",\"%s\"", url.c_str());
+  if (!gsmSendAT(cmd, "OK", GSM_HTTP_PARA_TIMEOUT_MS)) {
+    LOGW("[GSM][HTTP] set URL FAIL");
+    gsmSendAT("AT+HTTPTERM", "OK", 2000);
+    return false;
+  }
+
+  if (!gsmSendAT("AT+HTTPPARA=\"CONTENT\",\"application/json\"", "OK", GSM_HTTP_PARA_TIMEOUT_MS)) {
+    LOGW("[GSM][HTTP] set content-type FAIL");
+    gsmSendAT("AT+HTTPTERM", "OK", 2000);
+    return false;
+  }
+
+  uint16_t bodyLen = strlen(jsonLine);
+  snprintf(cmd, sizeof(cmd), "AT+HTTPDATA=%u,10000", bodyLen);
+  gsmFlushRx();
+  SerialGSM.print(cmd);
+  SerialGSM.print("\r\n");
+  if (!gsmWaitFor("DOWNLOAD", GSM_HTTP_DATA_PROMPT_TIMEOUT_MS)) {
+    LOGW("[GSM][HTTP] data prompt timeout");
+    gsmSendAT("AT+HTTPTERM", "OK", 2000);
+    return false;
+  }
+  SerialGSM.write((const uint8_t*)jsonLine, bodyLen);
+  if (!gsmWaitFor("OK", GSM_HTTP_DATA_CONFIRM_TIMEOUT_MS)) {
+    LOGW("[GSM][HTTP] data upload FAIL");
+    gsmSendAT("AT+HTTPTERM", "OK", 2000);
+    return false;
+  }
+
+  LOG("[GSM][HTTP] POST ");
+  LOGI(url);
+
+  char actionResp[GSM_AT_RESP_MAX];
+  if (!gsmSendAT("AT+HTTPACTION=1", "+HTTPACTION: 1,",
+                 GSM_HTTP_ACTION_TIMEOUT_MS, actionResp, sizeof(actionResp))) {
+    LOGW("[GSM][HTTP] action timeout");
+    gsmSendAT("AT+HTTPTERM", "OK", 2000);
+    return false;
+  }
+
+  int httpStatus = 0;
+  char* statusPos = strstr(actionResp, "+HTTPACTION: 1,");
+  if (statusPos != nullptr) {
+    httpStatus = atoi(statusPos + strlen("+HTTPACTION: 1,"));
+  }
+  if (httpStatus != 200) {
+    LOGF("[GSM][HTTP] POST FAIL, status=%d\n", httpStatus);
+    gsmSendAT("AT+HTTPTERM", "OK", 2000);
+    return false;
+  }
+  LOGI("[GSM] HTTP POST OK");
+
+  char readResp[GSM_AT_RESP_MAX];
+  bool haveBody = gsmSendAT("AT+HTTPREAD", "+HTTPREAD:",
+                            GSM_HTTP_READ_TIMEOUT_MS, readResp, sizeof(readResp));
+
+  gsmSendAT("AT+HTTPTERM", "OK", 2000);
+
+  if (!haveBody) {
+    LOGW("[GSM][HTTP] no body");
+    return false;
+  }
+
+  char* jsonStart = strchr(readResp, '{');
+  if (!jsonStart) {
+    LOGW("[GSM][HTTP] no JSON in response body");
+    return false;
+  }
+  return parseAck(jsonStart, seq);
+}
+
+// ============ GSM: MQTT TRANSPORT (AT+CMQTTSTART/ACCQ/CONNECT/PUB/SUB/DISC/STOP) ============
+bool gsmMqttSendPrompted(const char* atCmd, const char* data, uint32_t promptTimeoutMs) {
+  gsmFlushRx();
+  SerialGSM.print(atCmd);
+  SerialGSM.print("\r\n");
+  if (!gsmWaitFor(">", promptTimeoutMs)) {
+    return false;
+  }
+  SerialGSM.print(data);
+  return gsmWaitFor("OK", 2000);
+}
+
+bool gsmMqttEnsureConnected() {
+  if (gsmMqttConnected) return true;
+
+  char cmd[160];
+
+  if (!gsmMqttStarted) {
+    LOGI("[GSM][MQTT] starting service...");
+    if (!gsmSendAT("AT+CMQTTSTART", "+CMQTTSTART:", GSM_MQTT_START_TIMEOUT_MS)) {
+      LOGW("[GSM][MQTT] start FAIL");
+      return false;
+    }
+    gsmMqttStarted = true;
+  }
+
+  String clientId = "iot-node-" + String(config.device.boxID);
+  snprintf(cmd, sizeof(cmd), "AT+CMQTTACCQ=%d,\"%s\"", GSM_MQTT_CLIENT_IDX, clientId.c_str());
+  if (!gsmSendAT(cmd, "OK", GSM_MQTT_ACCQ_TIMEOUT_MS)) {
+    LOGW("[GSM][MQTT] ACCQ FAIL");
+    return false;
+  }
+
+  LOG("[GSM][MQTT] connecting ");
+  LOG(config.transport.host);
+  LOG(":");
+  LOGI(config.transport.port);
+
+  snprintf(cmd, sizeof(cmd), "AT+CMQTTCONNECT=%d,\"tcp://%s:%u\",60,1",
+           GSM_MQTT_CLIENT_IDX, config.transport.host.c_str(), config.transport.port);
+  char connResp[GSM_AT_RESP_MAX];
+  if (!gsmSendAT(cmd, "+CMQTTCONNECT:", GSM_MQTT_CONNECT_TIMEOUT_MS, connResp, sizeof(connResp))) {
+    LOGW("[GSM][MQTT] connect timeout");
+    return false;
+  }
+  // format: "+CMQTTCONNECT: <idx>,<result>" - result 0 = sukses
+  int result = -1;
+  char* p = strstr(connResp, "+CMQTTCONNECT:");
+  if (p != nullptr) {
+    char* comma = strchr(p, ',');
+    if (comma != nullptr) result = atoi(comma + 1);
+  }
+  if (result != 0) {
+    LOGF("[GSM][MQTT] connect FAIL, result=%d\n", result);
+    return false;
+  }
+  LOGI("[GSM] MQTT Connected");
+
+  String ackTopic = "iot/ack/" + String(config.device.boxID);
+  snprintf(cmd, sizeof(cmd), "AT+CMQTTSUBTOPIC=%d,%u,1",
+           GSM_MQTT_CLIENT_IDX, (unsigned)ackTopic.length());
+  if (!gsmMqttSendPrompted(cmd, ackTopic.c_str(), GSM_MQTT_TOPIC_PROMPT_TIMEOUT_MS)) {
+    LOGW("[GSM][MQTT] set sub-topic FAIL");
+    return false;
+  }
+  snprintf(cmd, sizeof(cmd), "AT+CMQTTSUB=%d", GSM_MQTT_CLIENT_IDX);
+  if (!gsmSendAT(cmd, "+CMQTTSUB:", GSM_MQTT_SUB_TIMEOUT_MS)) {
+    LOGW("[GSM][MQTT] subscribe FAIL");
+    return false;
+  }
+
+  gsmMqttConnected = true;
+  return true;
+}
+
+bool gsmMqttPublish(const char* topic, const char* payload) {
+  char cmd[64];
+
+  snprintf(cmd, sizeof(cmd), "AT+CMQTTTOPIC=%d,%u", GSM_MQTT_CLIENT_IDX, (unsigned)strlen(topic));
+  if (!gsmMqttSendPrompted(cmd, topic, GSM_MQTT_TOPIC_PROMPT_TIMEOUT_MS)) {
+    LOGW("[GSM][MQTT] set topic FAIL");
+    return false;
+  }
+
+  snprintf(cmd, sizeof(cmd), "AT+CMQTTPAYLOAD=%d,%u", GSM_MQTT_CLIENT_IDX, (unsigned)strlen(payload));
+  if (!gsmMqttSendPrompted(cmd, payload, GSM_MQTT_PAYLOAD_PROMPT_TIMEOUT_MS)) {
+    LOGW("[GSM][MQTT] set payload FAIL");
+    return false;
+  }
+
+  snprintf(cmd, sizeof(cmd), "AT+CMQTTPUB=%d,1,60", GSM_MQTT_CLIENT_IDX);  // QoS 1, timeout 60s
+  char pubResp[GSM_AT_RESP_MAX];
+  if (!gsmSendAT(cmd, "+CMQTTPUB:", GSM_MQTT_PUB_TIMEOUT_MS, pubResp, sizeof(pubResp))) {
+    LOGW("[GSM][MQTT] publish timeout");
+    return false;
+  }
+  int result = -1;
+  char* p = strstr(pubResp, "+CMQTTPUB:");
+  if (p != nullptr) {
+    char* comma = strchr(p, ',');
+    if (comma != nullptr) result = atoi(comma + 1);
+  }
+  return result == 0;
+}
+
+bool gsmMqttWaitAck(uint32_t seq, uint32_t timeoutMs) {
+  char buf[GSM_AT_RESP_MAX];
+  if (!gsmWaitFor("+CMQTTRXEND:", timeoutMs, buf, sizeof(buf))) {
+    return false;
+  }
+  char* jsonStart = strchr(buf, '{');
+  if (jsonStart == nullptr) {
+    return false;
+  }
+  return parseAck(jsonStart, seq);
+}
+
+void gsmMqttDisconnect() {
+  if (!gsmMqttStarted && !gsmMqttConnected) return;
+  char cmd[32];
+  snprintf(cmd, sizeof(cmd), "AT+CMQTTDISC=%d,60", GSM_MQTT_CLIENT_IDX);
+  gsmSendAT(cmd, "OK", 5000);
+  snprintf(cmd, sizeof(cmd), "AT+CMQTTREL=%d", GSM_MQTT_CLIENT_IDX);
+  gsmSendAT(cmd, "OK", 2000);
+  gsmSendAT("AT+CMQTTSTOP", "OK", 5000);
+  gsmMqttConnected = false;
+  gsmMqttStarted = false;
+}
+
+bool gsmMqttSendJSONWithSeq(uint32_t seq, const char* jsonLine) {
+  if (!gsmMqttEnsureConnected()) {
+    gsmMqttConnected = false;
+    return false;
+  }
+
+  LOGI("[GSM][MQTT] TX:");
+  LOGI(jsonLine);
+
+  if (!gsmMqttPublish(config.transport.path.c_str(), jsonLine)) {
+    LOGW("[GSM][MQTT] publish FAIL");
+    gsmMqttConnected = false;
+    return false;
+  }
+
+  bool ackOk = gsmMqttWaitAck(seq, ACK_TIMEOUT_MS);
+  if (ackOk) {
+    LOGI("[GSM][MQTT] ACK OK");
+  } else {
+    LOGW("[GSM][MQTT] ACK TIMEOUT");
+  }
+  return ackOk;
+}
+
+bool gsmSendJSONWithSeq(uint32_t seq, const char* jsonLine) {
+  if (!gsmIsReady()) {
+    LOGW("[GSM] belum READY (state=" + String(gsmStateToStr(gsmState)) + "), kirim dibatalkan");
+    return false;
+  }
+  if (strcasecmp(config.transport.type.c_str(), "tcp") == 0) {
+    return gsmTcpSendJSONWithSeq(seq, jsonLine);
+  }
+  if (strcasecmp(config.transport.type.c_str(), "httppost") == 0) {
+    return gsmHttpSendJSONWithSeq(seq, jsonLine);
+  }
+  if (strcasecmp(config.transport.type.c_str(), "mqtt") == 0) {
+    return gsmMqttSendJSONWithSeq(seq, jsonLine);
+  }
+  LOG("[GSM] transport tidak didukung: ");
+  LOGI(config.transport.type);
+  return false;
+}
+
 // ================ TRANSPORT HELPERS ==================
-// =====================================================
 bool httpPostJSONWithSeq(uint32_t seq, const char* jsonLine) {
   if (netState == NET_DOWN) {
     LOGW("[HTTP] network down");
@@ -950,7 +2052,7 @@ bool mqttSendJSONWithSeq(uint32_t seq, const char* jsonLine) {
       LOGI("[MQTT] ACK OK");
       return true;
     }
-    delay(1);  // beri jatah CPU ke task lain (WiFi/BLE stack di FreeRTOS)
+    delay(1);
   }
   LOGI("[MQTT] ACK TIMEOUT");
   return false;
@@ -970,6 +2072,10 @@ bool parseAck(const char* json, uint32_t expectSeq) {
 }
 
 bool sendByTransport(uint32_t seq, const char* jsonLine) {
+
+  if (isMode("gsm")) {
+    return gsmSendJSONWithSeq(seq, jsonLine);
+  }
   if (netState == NET_DOWN) return false;
   if (strcasecmp(config.transport.type.c_str(), "tcp") == 0) {
     return tcpSendJSONWithSeq(seq, jsonLine);
@@ -992,9 +2098,7 @@ bool sendByTransport(uint32_t seq, const char* jsonLine) {
   return false;
 }
 
-// =====================================================
 // ================== STM32 HELPERS ====================
-// =====================================================
 uint16_t CRC16_Modbus(const uint8_t* data, uint16_t len) {
   uint16_t crc = 0xFFFF;
   for (uint16_t i = 0; i < len; i++) {
@@ -1021,8 +2125,6 @@ void processFrame(uint8_t* buf, uint16_t len) {
     return;
   }
 
-  // Frame valid (SOF + CRC OK) -> link UART ke STM32 dianggap hidup,
-  // dipakai untuk deteksi communication error (LED ERROR 2 kedip).
   lastStmFrameMs = millis();
   if (errCommTimeout) {
     LOGI("[LED] comm timeout cleared, STM32 frame received");
@@ -1046,7 +2148,7 @@ void handleDataFromSTM(uint8_t* tlv, size_t len) {
   uint32_t seq = 0;
   uint32_t ts = 0;
   int16_t temp = 0, hum = 0;
-  uint16_t digMask = 0;
+  uint32_t digMask = 0;
   uint16_t an[4] = { 0 };
   uint8_t qMask = 0;
 
@@ -1073,8 +2175,8 @@ void handleDataFromSTM(uint8_t* tlv, size_t len) {
       case 0x03:  // HUM
         if (l == 2) hum = (int16_t)rd16(&tlv[i]);
         break;
-      case 0x04:  // DIG_IN
-        if (l == 2) digMask = rd16(&tlv[i]);
+      case 0x04:  // DIG_IN 
+        if (l == 4) digMask = rd32(&tlv[i]);
         break;
       case 0x05:  // AN_IN (4 channel)
         if (l == 8) {
@@ -1164,19 +2266,13 @@ void handleErrorFromSTM(uint8_t* tlv, size_t len) {
   if (moduleId == MOD_DHT) errDHT = (status == ST_ERR);
   if (moduleId == MOD_ADS) errADS = (status == ST_ERR);
   if (moduleId == MOD_SD) errSD = (status == ST_ERR);
-
-  // Modul selain RTC/DHT/ADS/SD (mis. modul comm RS485/UART STM32 di masa
-  // depan) dipetakan sebagai communication error pada LED ERROR (2 kedip),
-  // bukan sensor error. Saat ini STM32 belum mengirim moduleId semacam ini,
-  // jalur ini hanya menjaga agar siap dipakai tanpa perlu ubah LED logic lagi.
-  if (moduleId != MOD_RTC && moduleId != MOD_DHT &&
-      moduleId != MOD_ADS && moduleId != MOD_SD) {
+  if (moduleId != MOD_RTC && moduleId != MOD_DHT && moduleId != MOD_ADS && moduleId != MOD_SD) {
     errCommTLV = (status == ST_ERR);
   }
 
   anyErrorActive = errRTC || errDHT || errADS || errSD;
   errComm = errCommTimeout || errCommTLV;
-  
+
   if (status == ST_ERR) {
     LOGF("[ERR] %s ERROR (code=%u)\n", modStr, errCode);
   } else if (status == ST_OK) {
@@ -1190,16 +2286,24 @@ void handleErrorFromSTM(uint8_t* tlv, size_t len) {
 
 
 void sendAckToSTM(uint32_t seq) {
+
   uint8_t frame[16];
   uint16_t idx = 0;
 
-  frame[idx++] = SOF_BYTE;
-  frame[idx++] = 0x02;  // ACK
-  frame[idx++] = 0x00;
-  frame[idx++] = 0x04;
+  const uint8_t payloadLen = 6;  // 1 (tag) + 1 (len) + 4 (value)
 
-  memcpy(&frame[idx], &seq, 4);
-  idx += 4;
+  frame[idx++] = SOF_BYTE;
+  frame[idx++] = TYPE_ACK;
+  frame[idx++] = (payloadLen >> 8) & 0xFF;
+  frame[idx++] = payloadLen & 0xFF;
+
+  frame[idx++] = 0x01;  // TAG_SEQ
+  frame[idx++] = 0x04;  // LEN = 4 byte
+
+  frame[idx++] = (seq >> 24) & 0xFF;
+  frame[idx++] = (seq >> 16) & 0xFF;
+  frame[idx++] = (seq >> 8) & 0xFF;
+  frame[idx++] = seq & 0xFF;
 
   uint16_t crc = CRC16_Modbus(frame, idx);
   frame[idx++] = crc >> 8;
@@ -1260,17 +2364,21 @@ void sendRulesToSTM32() {
 }
 
 uint32_t parseDateTimeToEpoch(const String& dt) {
-  // format input: "YYYY-MM-DD HH:MM:SS"
+
   struct tm t {};
-  if (sscanf(dt.c_str(),
-             "%d-%d-%d %d:%d:%d",
-             &t.tm_year,
-             &t.tm_mon,
-             &t.tm_mday,
-             &t.tm_hour,
-             &t.tm_min,
-             &t.tm_sec)
-      != 6) {
+  int n = sscanf(dt.c_str(),
+                 "%d-%d-%d %d:%d:%d",
+                 &t.tm_year,
+                 &t.tm_mon,
+                 &t.tm_mday,
+                 &t.tm_hour,
+                 &t.tm_min,
+                 &t.tm_sec);
+
+  if (n == 5) {
+
+    t.tm_sec = 0;
+  } else if (n != 6) {
     LOGE("[RTC] invalid datetime format");
     return 0;
   }
@@ -1295,6 +2403,34 @@ uint32_t parseDateTimeToEpoch(const String& dt) {
        (unsigned long)unixEpoch,
        (unsigned long)epoch2000);
   return epoch2000;
+}
+
+
+void sendAddonMaskToSTM32(uint8_t mask) {
+  uint8_t tlv[3];
+  size_t idx = 0;
+
+  tlv[idx++] = TAG_ADDON_MASK;
+  tlv[idx++] = 1;  // len = 1 byte
+  tlv[idx++] = mask;
+
+  uint8_t frame[16];
+  uint16_t fidx = 0;
+
+  frame[fidx++] = SOF_BYTE;
+  frame[fidx++] = TYPE_ADDON;
+  frame[fidx++] = 0x00;
+  frame[fidx++] = idx;
+
+  memcpy(&frame[fidx], tlv, idx);
+  fidx += idx;
+
+  uint16_t crc = CRC16_Modbus(frame, fidx);
+  frame[fidx++] = crc >> 8;
+  frame[fidx++] = crc & 0xFF;
+
+  SerialSTM.write(frame, fidx);
+  LOGF("[ADDON] mask sent to STM32: 0x%02X\n", mask);
 }
 
 void sendRTCToSTM32(uint32_t epoch2000) {
@@ -1371,15 +2507,18 @@ void epochToISO8601(uint32_t epoch, char* out, size_t outLen) {
            hour, min, sec);
 }
 
-
-void buildDigArray(uint16_t mask, char* out, size_t len) {
+void buildDigArray(uint32_t digMask, char* out, size_t len) {
   size_t pos = 0;
   pos += snprintf(out + pos, len - pos, "[");
-  for (int i = 0; i < 12; i++) {
+  
+  int totalInputs = isAddon("ekspansi_input") ? 19 : 11;
+  
+  for (int i = 0; i < totalInputs; i++) {
+    int bit = (digMask >> i) & 1;
     pos += snprintf(out + pos, len - pos,
                     "%d%s",
-                    (mask >> i) & 1,
-                    (i < 11) ? "," : "");
+                    bit,
+                    (i < totalInputs - 1) ? "," : "");
   }
   snprintf(out + pos, len - pos, "]");
 }
@@ -1396,9 +2535,7 @@ void buildQArray(uint8_t mask, char* out, size_t len) {
   snprintf(out + pos, len - pos, "]");
 }
 
-// =====================================================
 // =============== INPUT/OUTPUT HELPERS ================
-// =====================================================
 void handleButton() {
   unsigned long now = millis();
   bool readNow = digitalRead(BTN_PIN);
@@ -1430,14 +2567,21 @@ void handleButton() {
   if (btnPressed && !longActionDone) {
     if (now - btnPressStart >= BTN_LONG_MS) {
       longActionDone = true;
-      LOGI("BTN long press");
+      LOGI("[BLE] Long Press Detected");
+      handleLongPress();
     }
   }
 }
 
-// =====================================================
+void handleLongPress() {
+  if (bleState == BLE_OFF) {
+    startBLE();
+  } else {
+    LOGI("[BLE] Long press diabaikan, BLE state saat ini = " + String((int)bleState));
+  }
+}
+
 // =================== EVENT HELPERS ===================
-// =====================================================
 void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_CONNECTED:
@@ -1493,9 +2637,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
 }
 
-// =====================================================
 // ======================== BLE ========================
-// =====================================================
 String buildBleName() {
   if (config.device.boxID > 0) {
     return "IoT-Node-" + String(config.device.boxID);
@@ -1513,9 +2655,79 @@ void getEspBaseMac(byte* mac) {
   mac[5] = (chipid)&0xFF;
 }
 
-// =====================================================
 // ======================= SETUP =======================
-// =====================================================
+// ================== ADDON: EKSPANSI INPUT (PCF8574) ==================
+uint8_t addonReadInputMask() {
+  uint8_t data = 0;
+  uint8_t mask = 0;
+
+  Wire.requestFrom(PCF8574_ADDR, 1);
+  if (Wire.available()) {
+    data = Wire.read();
+    for (uint8_t i = 0; i < 8; i++) {
+      if ((data & (1 << i)) == 0) {
+        // LOW = AKTIF
+        mask |= (1 << i);
+      }
+    }
+  }
+  return mask;
+}
+
+void addonExpansionInit() {
+  LOGI("[ADDON] Initializing Ekspansi Input (PCF8574)...");
+  Wire.begin(PIN_ADDON_SDA, PIN_ADDON_SCL);
+
+  Wire.beginTransmission(PCF8574_ADDR);
+  Wire.write(0xFF);
+  Wire.endTransmission();
+
+  addonLastPoll = 0;
+  addonRawMaskLast = addonReadInputMask();
+  addonLastChangeMs = millis();
+  LOGI("[ADDON] PCF8574 Input ready");
+}
+
+void addonExpansionLoop() {
+  unsigned long now = millis();
+  if (now - addonLastPoll < ADDON_POLL_INTERVAL_MS) return;
+  addonLastPoll = now;
+
+  uint8_t rawMask = addonReadInputMask();
+
+  if (rawMask != addonRawMaskLast) {
+    addonRawMaskLast = rawMask;
+    addonLastChangeMs = now;
+  }
+
+
+  if ((rawMask == addonInputMask) && addonMaskSentOnce) return;
+  if ((now - addonLastChangeMs) < ADDON_DEBOUNCE_MS) return;
+
+  String bin = "";
+  for (int i = 7; i >= 0; i--) {
+    bin += ((rawMask >> i) & 0x01) ? "1" : "0";
+  }
+  LOGF("[ADDON] Mask stabil: 0x%02X  BIN: %s\n", rawMask, bin.c_str());
+
+  if (rawMask != addonInputMask || !addonMaskSentOnce) {
+    addonInputMask = rawMask;
+    sendAddonMaskToSTM32(addonInputMask);
+    addonMaskSentOnce = true;
+  }
+}
+
+void initAddon() {
+  if (isAddon("gsm")) {
+    LOGI("[ADDON] type=gsm");
+  } else if (isAddon("ekspansi_input")) {
+    LOGI("[ADDON] type=ekspansi_input");
+    addonExpansionInit();
+  } else {
+    LOGI("[ADDON] type=none");
+  }
+}
+
 void initGPIO() {
   delay(200);
   LOGI("\n=== BOOT ===");
@@ -1524,10 +2736,8 @@ void initGPIO() {
   pinMode(LED_RUN, OUTPUT);
   pinMode(LED_ERR, OUTPUT);
 
-  // Mulai dari OFF; blink lambat untuk fase inisialisasi diteruskan secara
-  // non-blocking oleh updateStatusLeds() selama sysReady masih false.
-  digitalWrite(LED_RUN, LOW);
-  digitalWrite(LED_ERR, LOW);
+  ledWrite(LED_RUN, false);
+  ledWrite(LED_ERR, false);
 
   pinMode(BTN_PIN, INPUT_PULLUP);
   pinMode(PIN_CS_W5500, OUTPUT);
@@ -1557,12 +2767,7 @@ void initFS() {
   }
 }
 
-void initNetwork() {
-  WiFi.mode(WIFI_OFF);
-  delay(200);
-
-  netState = NET_DOWN;
-
+void startNetworkByConfig() {
   // ================== ETHERNET ONLY ==================
   if (isMode("ethernet")) {
     LOGI("[CFG] network mode: ethernet");
@@ -1576,6 +2781,17 @@ void initNetwork() {
     LOGI("[CFG] network mode: wifi");
     if (!tryWiFi()) {
       LOGI("[NET] WiFi unavailable");
+    }
+  }
+
+  // ================== GSM (add-on module) ==================
+  else if (isMode("gsm")) {
+    LOGI("[CFG] network mode: gsm");
+
+    if (!isAddon("gsm")) {
+      LOGE("[ADDON] network mode=gsm tapi addon.type bukan gsm, GSM TIDAK diinisialisasi");
+    } else {
+      gsmInit();
     }
   }
 
@@ -1602,54 +2818,121 @@ void initNetwork() {
   } else {
     LOGI("[CFG] unknown network mode");
   }
+}
+
+void initNetwork() {
+  WiFi.mode(WIFI_OFF);
+  delay(200);
+
+  netState = NET_DOWN;
+
+  startNetworkByConfig();
+
   LOGI("=== SETUP DONE ===");
 
-  // Inisialisasi selesai (terlepas dari hasil koneksi jaringan). Jika
-  // jaringan ternyata tidak berhasil, kondisi tersebut akan tertangkap
-  // sebagai network error (LED ERROR 3 kedip) lewat errNet, bukan membuat
-  // LED RUN blink inisialisasi selamanya.
   sysReady = true;
 }
 
-void initBLE() {
+void startBLE() {
+  if (bleState != BLE_OFF) {
+    LOGW("[BLE] startBLE() dipanggil saat bleState != BLE_OFF, diabaikan");
+    return;
+  }
+
+  bleState = BLE_STARTING;
+  LOGI("[BLE] Initializing...");
+
   String bleName = buildBleName();
   LOGI("[BLE] init name = " + bleName);
 
   BLEDevice::init(bleName.c_str());
-  BLEServer* server = BLEDevice::createServer();
-  server->setCallbacks(new BleServerCallbacks());
+  bleServer = BLEDevice::createServer();
+  bleServer->setCallbacks(&bleServerCallbacksInstance);
 
-  BLEService* service = server->createService(BLE_SERVICE_UUID);
+  bleGattService = bleServer->createService(BLE_SERVICE_UUID);
 
-  BLECharacteristic* rxChar = service->createCharacteristic(
+  bleRxChar = bleGattService->createCharacteristic(
     BLE_CHAR_UUID_RX,
     BLECharacteristic::PROPERTY_WRITE);
-  rxChar->setCallbacks(new BleRxCallbacks());
+  bleRxChar->setCallbacks(&bleRxCallbacksInstance);
 
-  bleTxChar = service->createCharacteristic(
+  bleTxChar = bleGattService->createCharacteristic(
     BLE_CHAR_UUID_TX,
     BLECharacteristic::PROPERTY_NOTIFY);
   bleTxChar->addDescriptor(new BLE2902());
 
-  service->start();
+  bleGattService->start();
 
   BLEAdvertising* adv = BLEDevice::getAdvertising();
   adv->addServiceUUID(BLE_SERVICE_UUID);
   adv->start();
-  LOGI("[BLE] advertising started");
+
+  bleClientConnected = false;
+  bleTransferReset();
+  bleRxReset();
+
+  bleState = BLE_RUNNING;
+  LOGI("[BLE] Advertising Started");
+}
+
+void stopBLE() {
+  if (bleState == BLE_OFF) {
+    LOGW("[BLE] stopBLE() dipanggil saat sudah BLE_OFF, diabaikan");
+    return;
+  }
+
+  bleState = BLE_STOPPING;
+
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  if (adv) adv->stop();
+  LOGI("[BLE] Stop Advertising");
+
+  bleTransferReset();
+  bleRxReset();
+  bleClientConnected = false;
+
+  bleServer = nullptr;
+  bleGattService = nullptr;
+  bleRxChar = nullptr;
+  bleTxChar = nullptr;
+
+  BLEDevice::deinit(true);
+
+  bleState = BLE_OFF;
+  LOGI("[BLE] Deinitialized");
+
+  delay(200);
+}
+
+void logResetReason() {
+
+  esp_reset_reason_t reason = esp_reset_reason();
+  const char* reasonStr;
+  switch (reason) {
+    case ESP_RST_POWERON: reasonStr = "POWERON (nyala normal dari mati total)"; break;
+    case ESP_RST_EXT: reasonStr = "EXTERNAL (reset pin dari luar)"; break;
+    case ESP_RST_SW: reasonStr = "SOFTWARE (ESP.restart() dipanggil kode)"; break;
+    case ESP_RST_PANIC: reasonStr = "PANIC (crash/exception firmware)"; break;
+    case ESP_RST_INT_WDT: reasonStr = "INTERRUPT WATCHDOG (ISR terlalu lama)"; break;
+    case ESP_RST_TASK_WDT: reasonStr = "TASK WATCHDOG (loop() terlalu lama tanpa yield)"; break;
+    case ESP_RST_WDT: reasonStr = "OTHER WATCHDOG"; break;
+    case ESP_RST_BROWNOUT: reasonStr = "BROWNOUT - suplai daya drop (KEMUNGKINAN BESAR penyebab restart saat GSM disambungkan - lihat komentar di logResetReason())"; break;
+    case ESP_RST_SDIO: reasonStr = "SDIO"; break;
+    default: reasonStr = "UNKNOWN/lainnya"; break;
+  }
+  LOGI("[BOOT] Reset reason: " + String(reasonStr));
 }
 
 void setup() {
   Serial.begin(115200);
+  logResetReason();
   initGPIO();
   initFS();
-  initBLE();
+  initAddon();
   initNetwork();
 }
 
-// =====================================================
 // ======================= LOOP ========================
-// =====================================================
 void handleHybridNetwork() {
   if (!isMode("hybrid")) return;
 
@@ -1690,7 +2973,7 @@ void handleHybridNetwork() {
   if (!wifiOk && !ethOk) {
     LOGE("[NET] all interfaces down → restart");
     fatalErr = true;
-    updateStatusLeds();   // pastikan LED RUN OFF / LED ERROR ON tetap terlihat
+    updateStatusLeds();
     delay(5000);
     ESP.restart();
   }
@@ -1729,17 +3012,36 @@ void handleUART() {
 }
 
 void handleBLE() {
+  bleTransferTask();
+  bleRxTimeoutCheck();
+
   if (needRestart) {
+    if (bleTransferBusy()) return;
     LOGI("[SYS] restarting to apply new config");
     delay(1200);
     ESP.restart();
   }
 }
 
+void handleGSM() {
+
+  if (!isMode("gsm") || !isAddon("gsm")) return;
+
+  gsmDetectLoop();
+  gsmNetworkLoop();
+}
+
+void handleAddonExpansion() {
+  if (!isAddon("ekspansi_input")) return;
+  addonExpansionLoop();
+}
+
 void loop() {
   handleButton();
   handleHybridNetwork();
   handleWebSocket();
+  handleGSM();
+  handleAddonExpansion();
   handleUART();
   handleBLE();
   updateLedErrorFlags();

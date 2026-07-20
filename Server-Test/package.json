@@ -1,0 +1,12 @@
+{
+  "name": "iot-node-test-server",
+  "version": "1.0.0",
+  "description": "Server uji coba TCP / HTTP POST / WebSocket untuk ESP32-STM32F411-USART (WiFi, Ethernet, maupun GSM)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

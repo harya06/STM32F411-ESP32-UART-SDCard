@@ -36,6 +36,15 @@
 #define NUM_ANALOG  4U
 #define NUM_INPUTS  11U
 #define NUM_OUTPUTS 4U
+
+/* ---- Addon Ekspansi Input (PCF8574, dibaca & dikirim oleh ESP32) ----
+ * Konvensi bit gabungan (disepakati dengan firmware ESP32):
+ *   bit 0..10  -> I1..I11   (native GPIO STM32, lihat g_inputs[])
+ *   bit 11..18 -> I12..I19  (addon PCF8574, dikirim ESP32 via FRAME_TYPE_ADDON)
+ */
+#define NUM_ADDON_INPUTS       8U
+#define ADDON_INPUT_BIT_OFFSET 11U
+#define NUM_INPUTS_TOTAL       (ADDON_INPUT_BIT_OFFSET + NUM_ADDON_INPUTS)  /* = 19 */
 /* USER CODE END First_Private_Defines */
 
 
@@ -79,7 +88,7 @@ typedef enum {
 /* Rule Definition */
 typedef struct {
     RuleLogic_t logic;
-    uint8_t     inputs[NUM_INPUTS];
+    uint8_t     inputs[NUM_INPUTS_TOTAL];  /* referensi input bisa I1..I20 */
     uint8_t     inputCount;
 } RuleDef_t;
 
@@ -89,7 +98,7 @@ typedef struct {
     DS3231_TimeTypeDef rtc;
     int16_t            temp;        		// °C × 10
     int16_t            hum;        			// % × 10
-    uint16_t           dig_in;      		// bitmask
+    uint32_t           dig_in;      		// bitmask, bit0..19 = I1..I20 (lihat NUM_INPUTS_TOTAL)
     uint16_t           an_in[NUM_ANALOG];   // 0-255
     uint8_t            q;           		// output bitmask
 } Measurement_t;
@@ -144,7 +153,7 @@ static WatchdogHealth_t wd;
 #define TLV_TAG_SEQ         0x01    // uint32 BE
 #define TLV_TAG_TEMP        0x02    // int16 BE (°C × 10)
 #define TLV_TAG_HUM         0x03    // int16 BE (% × 10)
-#define TLV_TAG_DIG_IN      0x04    // uint16 BE (bitmask)
+#define TLV_TAG_DIG_IN      0x04    // uint32 BE (bitmask, bit0..19 = I1..I20 - lihat NUM_INPUTS_TOTAL). BREAKING CHANGE: sebelumnya uint16 (2 byte), sekarang 4 byte - ESP32 wajib update decode-nya juga.
 #define TLV_TAG_AN_IN       0x05    // uint16[4] BE
 #define TLV_TAG_Q           0x06    // uint8 (bitmask)
 #define TLV_TAG_TIMESTAMP   0x07    // uint32 BE
@@ -154,11 +163,13 @@ static WatchdogHealth_t wd;
 #define FRAME_TYPE_ACK      0x02
 #define FRAME_TYPE_RULES    0x03
 #define FRAME_TYPE_RTC      0x04
-#define FRAME_TYPE_ERROR    0x05
+#define FRAME_TYPE_ERROR    0x05   // arah STM32 -> ESP32 (laporan error)
+#define FRAME_TYPE_ADDON    0x06   // arah ESP32 -> STM32 (status input addon PCF8574)
 
 /* TLV tags from ESP32 */
 #define TAG_RULE            0x10
 #define TAG_RTC_TS          0x20
+#define TAG_ADDON_MASK      0x40   // payload 1 byte: bitmask 8 input PCF8574 (aktif=1), lihat FRAME_TYPE_ADDON
 
 /* TLV tags for error report STM32 -> ESP */
 #define TLV_TAG_ERR_MODULE  0x30   // u8
@@ -242,7 +253,9 @@ static char      g_debugBuf[384];
 static uint32_t  g_bootMs = 0;
 
 /* Input state */
-static volatile uint16_t g_inputMaskStable = 0;
+static volatile uint32_t g_inputMaskStable = 0;  /* gabungan I1..I20 (native | addon<<12), dipakai rule engine & dig_in */
+static volatile uint16_t g_nativeInputMask = 0;  /* komponen native GPIO saja (I1..I11), didebounce di App_BackgroundSensors */
+static volatile uint8_t  g_addonInputMask  = 0;  /* komponen addon PCF8574 (I13..I20), diterima via FRAME_TYPE_ADDON, sudah didebounce di ESP32 */
 static volatile uint8_t  g_ruleUpdated     = 0;
 
 /* ADS1115 */
@@ -379,8 +392,10 @@ static void ParseOneRuleString(const char *ruleStr);
 static void ParseRulesTLV(const uint8_t *tlv, size_t len);
 static void ParseRTCTLV(const uint8_t *tlv, size_t len);
 static void ParseACKTLV(const uint8_t *tlv, size_t len);
-static uint8_t EvalOutputState(int qIdx, uint16_t inputMask);
-static void ApplyRules(uint16_t inputMask);
+static void ParseAddonTLV(const uint8_t *tlv, size_t len);
+static void RecomputeCombinedInputMask(void);
+static uint8_t EvalOutputState(int qIdx, uint32_t inputMask);
+static void ApplyRules(uint32_t inputMask);
 static void PrintRuleStatus(void);
 static void OnFrameReceived(uint8_t *payload, uint16_t len, uint8_t frameType);
 
@@ -1409,7 +1424,7 @@ static size_t TLV_EncodeMeasurement(const Measurement_t *m, uint8_t *out, size_t
     idx += TLV_PutU32(&out[idx], TLV_TAG_TIMESTAMP, timestamp);
     idx += TLV_PutI16(&out[idx], TLV_TAG_TEMP, m->temp);
     idx += TLV_PutI16(&out[idx], TLV_TAG_HUM, m->hum);
-    idx += TLV_PutU16(&out[idx], TLV_TAG_DIG_IN, m->dig_in);
+    idx += TLV_PutU32(&out[idx], TLV_TAG_DIG_IN, m->dig_in);  // sekarang 4 byte (I1..I20), lihat catatan TLV_TAG_DIG_IN
     idx += TLV_PutU16Array4(&out[idx], TLV_TAG_AN_IN, m->an_in);
     idx += TLV_PutU8(&out[idx], TLV_TAG_Q, m->q);
 
@@ -1518,10 +1533,10 @@ static size_t JSON_EncodeMeasurement(const Measurement_t *m, char *out, size_t m
     // 2) Build dig_in array string [1,0,1,0,...]
     p = digArr;
     *p++ = '[';
-    for (uint8_t i = 0; i < NUM_INPUTS; i++) {
+    for (uint8_t i = 0; i < NUM_INPUTS_TOTAL; i++) {
         uint8_t bit = (m->dig_in & (1U << i)) ? 1 : 0;
         n = snprintf(p, sizeof(digArr) - (p - digArr), "%u%s",
-                     bit, (i < NUM_INPUTS - 1) ? "," : "");
+                     bit, (i < NUM_INPUTS_TOTAL - 1) ? "," : "");
         if (n > 0) p += n;
     }
     *p++ = ']';
@@ -1705,9 +1720,11 @@ static void ParseOneRuleString(const char *ruleStr)
         if (*r == 'I')
         {
             int inNum = atoi(r + 1);
-            if (inNum >= 1 && inNum <= (int)NUM_INPUTS)
+            /* I1..I11 = native GPIO, I12 = reserved (belum ada GPIO fisik),
+             * I13..I20 = addon PCF8574 (lihat NUM_INPUTS_TOTAL) */
+            if (inNum >= 1 && inNum <= (int)NUM_INPUTS_TOTAL)
             {
-                if (g_rules[qIdx].inputCount < NUM_INPUTS)
+                if (g_rules[qIdx].inputCount < NUM_INPUTS_TOTAL)
                 {
                     g_rules[qIdx].inputs[g_rules[qIdx].inputCount++] = (uint8_t)inNum;
                 }
@@ -1793,7 +1810,56 @@ static void ParseACKTLV(const uint8_t *tlv, size_t len)
     }
 }
 
-static uint8_t EvalOutputState(int qIdx, uint16_t inputMask)
+/* Gabungkan komponen native (I1..I11) + addon (I13..I20) jadi satu mask 20-bit
+ * yang dipakai rule engine (ApplyRules) dan dikirim sebagai dig_in ke ESP32.
+ * Kalau hasil gabungan berubah, set g_io_changed_flag supaya
+ * App_HandleAcquisition() langsung kirim measurement (jalur "trigger by IO change"
+ * yang sudah ada, dipakai bareng utk native GPIO maupun addon). */
+static void RecomputeCombinedInputMask(void)
+{
+    uint32_t combined = (uint32_t)g_nativeInputMask |
+                         ((uint32_t)g_addonInputMask << ADDON_INPUT_BIT_OFFSET);
+
+    if (combined != g_inputMaskStable)
+    {
+        g_inputMaskStable = combined;
+        g_io_changed_flag = 1;
+    }
+}
+
+/* Terima status input addon (PCF8574) dari ESP32 (FRAME_TYPE_ADDON).
+ * ESP32 sudah men-debounce pembacaan I2C-nya sendiri sebelum kirim frame ini,
+ * jadi di sisi STM32 tidak perlu debounce ulang - cukup terima & gabungkan. */
+static void ParseAddonTLV(const uint8_t *tlv, size_t len)
+{
+    size_t i = 0;
+    while (i + 2 <= len)
+    {
+        uint8_t tag = tlv[i];
+        uint8_t l   = tlv[i + 1];
+
+        if (i + 2 + l > len) break;
+
+        if (tag == TAG_ADDON_MASK && l == 1)
+        {
+            uint8_t newAddonMask = tlv[i + 2];
+            if (newAddonMask != g_addonInputMask)
+            {
+                g_addonInputMask = newAddonMask;
+                RecomputeCombinedInputMask();
+
+                snprintf(g_debugBuf, sizeof(g_debugBuf),
+                         "[ADDON] mask updated from ESP32: 0x%02X\r\n",
+                         newAddonMask);
+                UART_Print(g_debugBuf);
+            }
+        }
+
+        i += 2 + l;
+    }
+}
+
+static uint8_t EvalOutputState(int qIdx, uint32_t inputMask)
 {
     RuleDef_t *r = &g_rules[qIdx];
 
@@ -1832,7 +1898,7 @@ static uint8_t EvalOutputState(int qIdx, uint16_t inputMask)
     return 0;
 }
 
-static void ApplyRules(uint16_t inputMask)
+static void ApplyRules(uint32_t inputMask)
 {
     for (int q = 0; q < NUM_OUTPUTS; q++)
     {
@@ -1889,6 +1955,11 @@ static void OnFrameReceived(uint8_t *payload, uint16_t len, uint8_t frameType)
         case FRAME_TYPE_ACK:
 //            Debug_DumpTLV("[RX][ACK]", payload, len);
             ParseACKTLV(payload, len);
+            break;
+
+        case FRAME_TYPE_ADDON:
+//            Debug_DumpTLV("[RX][ADDON]", payload, len);
+            ParseAddonTLV(payload, len);
             break;
 
         default:
@@ -2209,7 +2280,8 @@ static void App_BackgroundSensors(uint32_t now)
         }
         stableMask        = mask0;
         lastRawMask       = mask0;
-        g_inputMaskStable = mask0;
+        g_nativeInputMask = mask0;
+        RecomputeCombinedInputMask();
         lastChangeMs      = now;
         lastDhtMs         = now - 2000U;
         initialized       = 1;
@@ -2265,12 +2337,12 @@ static void App_BackgroundSensors(uint32_t now)
     if ((rawMask != stableMask) && ((now - lastChangeMs) >= INPUT_CHANGE_TIME_MS))
     {
         stableMask        = rawMask;
-        g_inputMaskStable = stableMask;
-        g_io_changed_flag = 1;
+        g_nativeInputMask = stableMask;
+        RecomputeCombinedInputMask();  // set g_io_changed_flag kalau gabungan (native|addon) berubah
     }
 
-    // Apply rules
-    static uint16_t lastAppliedMask = 0xFFFF;
+    // Apply rules (pakai mask gabungan I1..I20, bukan native saja)
+    static uint32_t lastAppliedMask = 0xFFFFFFFFUL;
     if (g_inputMaskStable != lastAppliedMask || g_ruleUpdated)
     {
         ApplyRules(g_inputMaskStable);
@@ -2632,10 +2704,10 @@ static void Debug_PrintMeasurementJSON(const Measurement_t *m, bool byIo)
     // Build dig_in array
     p = digArr;
     *p++ = '[';
-    for (uint8_t i = 0; i < NUM_INPUTS; i++) {
+    for (uint8_t i = 0; i < NUM_INPUTS_TOTAL; i++) {
         uint8_t bit = (m->dig_in & (1U << i)) ? 1 : 0;
         n = snprintf(p, sizeof(digArr) - (p - digArr), "%u%s",
-                     bit, (i < NUM_INPUTS - 1) ? "," : "");
+                     bit, (i < NUM_INPUTS_TOTAL - 1) ? "," : "");
         if (n > 0) p += n;
     }
     *p++ = ']';
