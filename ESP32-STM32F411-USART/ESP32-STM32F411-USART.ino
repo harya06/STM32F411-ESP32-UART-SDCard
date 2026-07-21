@@ -14,7 +14,6 @@
 #include <WiFi.h>
 #include <Wire.h>
 
-
 enum NetIf {
   IF_NONE,
   IF_WIFI,
@@ -125,13 +124,13 @@ inline void ledWrite(uint8_t pin, bool on) {
 
 // ================== STM32 FRAME ==================
 #define SOF_BYTE 0x7E
-#define MAX_PAYLOAD 240
-#define MAX_FRAME 256
+#define MAX_PAYLOAD 512
+#define MAX_FRAME 540
 #define STM_EPOCH_OFFSET 946684800UL
 
 // ===== UART DATA =====
 #define MAX_RULES 10
-#define MAX_RULE_LEN 32
+#define MAX_RULE_LEN 100
 #define TYPE_DATA 0x01
 #define TYPE_ACK 0x02
 #define TYPE_RULES 0x03
@@ -237,7 +236,7 @@ unsigned long btnPressStart = 0;
 unsigned long lastNetCheck = 0;
 bool longActionDone = false;
 bool wsConnected = false;
-volatile bool needRestart = false;  // set setelah SAVE CONFIG sukses via BLE → ESP.restart() di loop()
+volatile bool needRestart = false;
 volatile bool wsAckOk = false;
 volatile uint32_t wsAckSeq = 0;
 bool errRTC = false;

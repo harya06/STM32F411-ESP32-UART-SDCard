@@ -202,8 +202,8 @@ static WatchdogHealth_t wd;
 #define ERR_CRC       3
 
 /* Buffers */
-#define RX_BUF_SIZE             256U
-#define UART_FRAME_MAX_LEN      300U
+#define RX_BUF_SIZE             540U
+#define UART_FRAME_MAX_LEN      540U
 #define JSON_LINE_MAX           320U
 
 /* Timing */
@@ -1810,11 +1810,6 @@ static void ParseACKTLV(const uint8_t *tlv, size_t len)
     }
 }
 
-/* Gabungkan komponen native (I1..I11) + addon (I13..I20) jadi satu mask 20-bit
- * yang dipakai rule engine (ApplyRules) dan dikirim sebagai dig_in ke ESP32.
- * Kalau hasil gabungan berubah, set g_io_changed_flag supaya
- * App_HandleAcquisition() langsung kirim measurement (jalur "trigger by IO change"
- * yang sudah ada, dipakai bareng utk native GPIO maupun addon). */
 static void RecomputeCombinedInputMask(void)
 {
     uint32_t combined = (uint32_t)g_nativeInputMask |
@@ -1827,9 +1822,6 @@ static void RecomputeCombinedInputMask(void)
     }
 }
 
-/* Terima status input addon (PCF8574) dari ESP32 (FRAME_TYPE_ADDON).
- * ESP32 sudah men-debounce pembacaan I2C-nya sendiri sebelum kirim frame ini,
- * jadi di sisi STM32 tidak perlu debounce ulang - cukup terima & gabungkan. */
 static void ParseAddonTLV(const uint8_t *tlv, size_t len)
 {
     size_t i = 0;
@@ -2338,10 +2330,9 @@ static void App_BackgroundSensors(uint32_t now)
     {
         stableMask        = rawMask;
         g_nativeInputMask = stableMask;
-        RecomputeCombinedInputMask();  // set g_io_changed_flag kalau gabungan (native|addon) berubah
+        RecomputeCombinedInputMask();
     }
 
-    // Apply rules (pakai mask gabungan I1..I20, bukan native saja)
     static uint32_t lastAppliedMask = 0xFFFFFFFFUL;
     if (g_inputMaskStable != lastAppliedMask || g_ruleUpdated)
     {
