@@ -216,7 +216,13 @@ inline void ledWrite(uint8_t pin, bool on) {
 #define LED_ERR_BLINK_ON_MS 150U      // durasi tiap kedip ON
 #define LED_ERR_BLINK_OFF_MS 150U     // jeda antar kedip dalam 1 pattern
 #define LED_ERR_PATTERN_GAP_MS 1200U  // jeda sebelum pattern diulang
-#define STM_COMM_TIMEOUT_MS 8000U     // batas waktu tanpa frame valid dari STM32
+
+// ================== STM32 COMM WATCHDOG ==================
+#define STM_DATA_PERIOD_MS           60000UL
+#define STM_COMM_MISSED_CYCLES_ALLOWED  2UL  
+#define STM_COMM_JITTER_MARGIN_MS       15000UL
+#define STM_COMM_TIMEOUT_MS ((STM_DATA_PERIOD_MS * STM_COMM_MISSED_CYCLES_ALLOWED) + STM_COMM_JITTER_MARGIN_MS)  // = 135000 ms 
+#define STM_COMM_CONFIRM_MS           3000UL
 
 // ================== GLOBAL ==================
 BLECharacteristic* bleTxChar = nullptr;
@@ -269,13 +275,23 @@ BleRxTransfer bleRx;
 
 // ================== SYSTEM / LED STATUS ==================
 bool sysReady = false;
-bool errCommTimeout = false;
+bool errCommTimeout = false;  // true = LED harus tampilkan pola error comm (hasil akhir StmComm_Update())
 bool errCommTLV = false;
 bool errComm = false;
 bool errNet = false;
 bool fatalErr = false;
-unsigned long lastStmFrameMs = 0;
+unsigned long lastStmFrameMs = 0;   // timestamp frame TERAKHIR yg valid (SOF+CRC OK) dari STM32
 static uint8_t ledErrBlinksTarget = 0;
+
+// ---- STM32 comm watchdog: state machine kecil, modular, terpisah dari
+// LED rendering. Lihat StmComm_Update()/StmComm_NotifyValidFrame(). ----
+enum StmCommState {
+  STM_COMM_OK = 0,      // frame valid masih diterima dlm batas STM_COMM_TIMEOUT_MS
+  STM_COMM_SUSPECT,     // ambang timeout terlampaui, menunggu konfirmasi STM_COMM_CONFIRM_MS
+  STM_COMM_LOST         // sudah terkonfirmasi hilang -> errCommTimeout = true
+};
+static StmCommState stmCommState = STM_COMM_OK;
+static unsigned long stmCommSuspectSinceMs = 0;
 
 // ================== NETWORK ==================
 byte mac[6];
@@ -377,12 +393,67 @@ const char* moduleToStr(uint8_t mid) {
   }
 }
 
+// ================== STM32 COMM WATCHDOG (modular) ==================
+// Dipanggil sekali setiap kali processFrame() berhasil memvalidasi sebuah
+// frame dari STM32 (SOF cocok DAN CRC16 cocok - lihat processFrame()).
+// Byte UART mentah/frame rusak TIDAK memanggil ini, jadi timeout hanya
+// dihitung dari paket yang benar2 valid, bukan sekadar aktivitas UART.
+void StmComm_NotifyValidFrame() {
+  lastStmFrameMs = millis();
+
+  if (stmCommState != STM_COMM_OK) {
+    LOGI("[COMM] STM32 comm pulih, frame valid diterima kembali");
+  }
+  stmCommState = STM_COMM_OK;
+  stmCommSuspectSinceMs = 0;
+  errCommTimeout = false;
+}
+
+// Dipanggil tiap iterasi loop() dari updateLedErrorFlags(). Pure time-check,
+// tidak menyentuh UART - jadi murni "last valid packet timestamp" + state
+// machine kecil dgn 1 langkah debounce (SUSPECT) sebelum LOST final.
+void StmComm_Update() {
+  // Belum pernah terima 1 pun frame valid sejak boot -> jangan dianggap
+  // timeout (biarkan proses awal komunikasi berjalan dulu).
+  if (lastStmFrameMs == 0) return;
+
+  unsigned long silenceMs = millis() - lastStmFrameMs;  // aman thd rollover millis()
+
+  switch (stmCommState) {
+    case STM_COMM_OK:
+      if (silenceMs > STM_COMM_TIMEOUT_MS) {
+        stmCommState = STM_COMM_SUSPECT;
+        stmCommSuspectSinceMs = millis();
+        LOGW("[COMM] STM32 comm suspect timeout, menunggu konfirmasi...");
+      }
+      break;
+
+    case STM_COMM_SUSPECT:
+      if (silenceMs <= STM_COMM_TIMEOUT_MS) {
+        // Fallback jaga2 (normalnya StmComm_NotifyValidFrame() sudah
+        // langsung mengembalikan ke OK begitu frame valid diterima).
+        stmCommState = STM_COMM_OK;
+        stmCommSuspectSinceMs = 0;
+        break;
+      }
+      if ((millis() - stmCommSuspectSinceMs) >= STM_COMM_CONFIRM_MS) {
+        stmCommState = STM_COMM_LOST;
+        errCommTimeout = true;
+        LOGF("[ERROR] [COMM] STM32 comm timeout TERKONFIRMASI, sudah %lu ms tanpa frame valid\n",
+             silenceMs);
+      }
+      break;
+
+    case STM_COMM_LOST:
+      // Tetap LOST sampai ada frame valid baru masuk (lihat
+      // StmComm_NotifyValidFrame()). errCommTimeout tetap true di sini.
+      break;
+  }
+}
+
 // ================== LED STATUS LOGIC ==================
 void updateLedErrorFlags() {
-  if (!errCommTimeout && (millis() - lastStmFrameMs > STM_COMM_TIMEOUT_MS) && lastStmFrameMs != 0) {
-    errCommTimeout = true;
-    LOGW("[LED] STM32 comm timeout terdeteksi");
-  }
+  StmComm_Update();
   errComm = errCommTimeout || errCommTLV;
   errNet = sysReady && (netState == NET_DOWN);
 
@@ -2124,11 +2195,8 @@ void processFrame(uint8_t* buf, uint16_t len) {
     return;
   }
 
-  lastStmFrameMs = millis();
-  if (errCommTimeout) {
-    LOGI("[LED] comm timeout cleared, STM32 frame received");
-  }
-  errCommTimeout = false;
+  // Frame valid (SOF + CRC OK) -> beri tahu watchdog komunikasi STM32.
+  StmComm_NotifyValidFrame();
   errComm = errCommTimeout || errCommTLV;
 
   uint8_t type = buf[1];
@@ -2308,6 +2376,7 @@ void sendAckToSTM(uint32_t seq) {
   frame[idx++] = crc >> 8;
   frame[idx++] = crc & 0xFF;
 
+  SerialSTM.flush();
   SerialSTM.write(frame, idx);
   LOGI("[UART] ACK sent seq=" + String(seq));
 }
@@ -2991,6 +3060,11 @@ void handleUART() {
       if (b != SOF_BYTE) continue;
       frameBuf[frameIdx++] = b;
     } else {
+      if (frameIdx >= MAX_FRAME) {
+        frameIdx = 0;
+        expectedLength = -1;
+        continue;
+      }
       frameBuf[frameIdx++] = b;
       if (frameIdx == 4) {
         uint16_t payloadLen =

@@ -210,7 +210,7 @@ static WatchdogHealth_t wd;
 #define INPUT_CHANGE_TIME_MS    500U
 #define DELIVERY_TIME_INTERVAL  60000U
 #define TX_MAX_RETRY            3U
-#define ACK_TIMEOUT_MS          2000U
+#define ACK_TIMEOUT_MS          5000U
 
 /* DHT error reporting delay */
 #define DHT_ERROR_ENABLE_DELAY_MS   5000U   // 5 detik setelah boot
@@ -219,8 +219,8 @@ static WatchdogHealth_t wd;
 #define SD_STATUS_INTERVAL_MS   8000U
 
 /* Rules */
-#define RULE_MAX_PAYLOAD        240U
-#define RULE_STR_MAX_LEN        32U
+#define RULE_MAX_PAYLOAD        420U
+#define RULE_STR_MAX_LEN        100U
 
 /* File names*/
 #define LOG_FILE_NAME           "log.json"
@@ -258,6 +258,18 @@ static volatile uint16_t g_nativeInputMask = 0;  /* komponen native GPIO saja (I
 static volatile uint8_t  g_addonInputMask  = 0;  /* komponen addon PCF8574 (I13..I20), diterima via FRAME_TYPE_ADDON, sudah didebounce di ESP32 */
 static volatile uint8_t  g_ruleUpdated     = 0;
 
+/* ---- Addon Type detection ----
+ * ESP32 HANYA mengirim frame FRAME_TYPE_ADDON (mask PCF8574) ketika
+ * config.addon.type == "ekspansi_input" (lihat handleAddonExpansion() pada
+ * firmware ESP32, yang men-skip addonExpansionLoop() untuk addon type
+ * "none"/"gsm"). Karena itu, kedatangan frame ini adalah sinyal yang bisa
+ * dipakai STM32 untuk mengetahui Addon Type yang sedang aktif TANPA perlu
+ * menambah TLV/frame baru pada protokol UART:
+ *   - belum pernah terima FRAME_TYPE_ADDON -> Addon Type = None/GSM -> 11 input
+ *   - sudah pernah terima FRAME_TYPE_ADDON -> Addon Type = Expansion Input -> 19 input
+ */
+static volatile uint8_t  g_addonExpansionActive = 0;
+
 /* ADS1115 */
 static int16_t  g_anRaw[NUM_ANALOG];
 static uint8_t  g_anCache[NUM_ANALOG];
@@ -291,6 +303,15 @@ volatile uint32_t g_ack_seq     = 0;
 /* TX state machine */
 static TxState_t   g_txState = TX_STATE_IDLE;
 static TxContext_t g_txCtx;
+static uint32_t g_pendingLogCount = 0;
+static uint32_t g_lastFailedSeq = 0;
+static uint32_t g_lastFailedTick = 0;
+
+/* Deferred UART Frame Processing */
+static volatile uint8_t g_deferredFramePending = 0;
+static uint8_t g_deferredFrameBuf[UART_FRAME_MAX_LEN];
+static uint16_t g_deferredFrameLen = 0;
+static uint8_t g_deferredFrameType = 0;
 
 /* Error flags */
 static uint8_t g_err_rtc = 0;
@@ -394,6 +415,7 @@ static void ParseRTCTLV(const uint8_t *tlv, size_t len);
 static void ParseACKTLV(const uint8_t *tlv, size_t len);
 static void ParseAddonTLV(const uint8_t *tlv, size_t len);
 static void RecomputeCombinedInputMask(void);
+static inline uint8_t Addon_ActiveInputCount(void);
 static uint8_t EvalOutputState(int qIdx, uint32_t inputMask);
 static void ApplyRules(uint32_t inputMask);
 static void PrintRuleStatus(void);
@@ -402,7 +424,6 @@ static void OnFrameReceived(uint8_t *payload, uint16_t len, uint8_t frameType);
 /* Logging / ACK helper */
 static bool Log_RemoveSeq(uint32_t seqToRemove);
 static bool SendMeasurementTLV(const Measurement_t *m);
-static void App_HandleAck(void);
 
 /* TX state machine */
 static void TX_StartNew(const Measurement_t *m);
@@ -419,6 +440,7 @@ static void SD_StatusTask(uint32_t now);
 static void App_BackgroundSensors(uint32_t now);
 static void App_HandleAcquisition(uint32_t now);
 static void Acquire_FillMeasurement(Measurement_t *m, const DS3231_TimeTypeDef *rtc);
+static void UART_ProcessPendingFrame(void);
 
 /* Debug */
 static void Debug_ErrorJson(uint8_t mid, uint8_t st, uint8_t ec);
@@ -559,8 +581,8 @@ int main(void)
           App_HandleAcquisition(now);
           WD_SetAcquisition();
 
-          App_HandleAck();
-          WD_SetAck();
+          UART_ProcessPendingFrame();
+          wd.ack = 1;
 
           TX_Process(now);
           WD_SetTX();
@@ -1531,12 +1553,15 @@ static size_t JSON_EncodeMeasurement(const Measurement_t *m, char *out, size_t m
              m->rtc.hours, m->rtc.minutes, m->rtc.seconds);
 
     // 2) Build dig_in array string [1,0,1,0,...]
+    // Jumlah elemen mengikuti Addon Type aktif (11 utk None/GSM, 19 utk
+    // Expansion Input), identik dgn perilaku buildDigArray() di ESP32.
+    uint8_t digCount = Addon_ActiveInputCount();
     p = digArr;
     *p++ = '[';
-    for (uint8_t i = 0; i < NUM_INPUTS_TOTAL; i++) {
+    for (uint8_t i = 0; i < digCount; i++) {
         uint8_t bit = (m->dig_in & (1U << i)) ? 1 : 0;
         n = snprintf(p, sizeof(digArr) - (p - digArr), "%u%s",
-                     bit, (i < NUM_INPUTS_TOTAL - 1) ? "," : "");
+                     bit, (i < digCount - 1) ? "," : "");
         if (n > 0) p += n;
     }
     *p++ = ']';
@@ -1643,7 +1668,12 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
                 if (crcRecv == crcCalc)
                 {
                     uint8_t frameType = g_frameBuf[1];
-                    OnFrameReceived(&g_frameBuf[4], payloadLen, frameType);
+                    if (!g_deferredFramePending) {
+                        memcpy(g_deferredFrameBuf, &g_frameBuf[4], payloadLen);
+                        g_deferredFrameLen = payloadLen;
+                        g_deferredFrameType = frameType;
+                        g_deferredFramePending = 1;
+                    }
                 }
 
                 g_frameIdx    = 0;
@@ -1822,6 +1852,16 @@ static void RecomputeCombinedInputMask(void)
     }
 }
 
+/* Jumlah Digital Input yang aktif saat ini, mengikuti Addon Type:
+ *   - Expansion Input -> NUM_INPUTS_TOTAL (19)
+ *   - None / GSM      -> NUM_INPUTS (11)
+ * Dipakai oleh semua jalur yang membentuk array dig_in (log JSON ke SD
+ * Card & debug JSON) supaya jumlahnya identik dengan firmware ESP32. */
+static inline uint8_t Addon_ActiveInputCount(void)
+{
+    return g_addonExpansionActive ? (uint8_t)NUM_INPUTS_TOTAL : (uint8_t)NUM_INPUTS;
+}
+
 static void ParseAddonTLV(const uint8_t *tlv, size_t len)
 {
     size_t i = 0;
@@ -1835,6 +1875,19 @@ static void ParseAddonTLV(const uint8_t *tlv, size_t len)
         if (tag == TAG_ADDON_MASK && l == 1)
         {
             uint8_t newAddonMask = tlv[i + 2];
+
+            /* Frame FRAME_TYPE_ADDON hanya pernah dikirim ESP32 ketika
+             * Addon Type = Expansion Input, jadi kedatangannya (terlepas
+             * dari mask-nya berubah atau tidak) menandai Addon Type aktif. */
+            if (!g_addonExpansionActive)
+            {
+                g_addonExpansionActive = 1;
+                snprintf(g_debugBuf, sizeof(g_debugBuf),
+                         "[ADDON] Expansion Input terdeteksi aktif, Digital Input = %u channel\r\n",
+                         (unsigned)NUM_INPUTS_TOTAL);
+                UART_Print(g_debugBuf);
+            }
+
             if (newAddonMask != g_addonInputMask)
             {
                 g_addonInputMask = newAddonMask;
@@ -2041,20 +2094,24 @@ static bool Log_RecoverTask(void)
     char line[JSON_LINE_MAX];
     uint32_t seq;
     uint32_t maxSeq = 0;
+    uint32_t lineCount = 0;
 
     while (f_gets(line, sizeof(line), &file) != NULL) {
+        HAL_IWDG_Refresh(&hiwdg);
         if (JSON_ParseSeqFromLine(line, &seq)) {
             if (seq > maxSeq) maxSeq = seq;
+            lineCount++;
         }
     }
 
     f_close(&file);
 
     g_nextSeq = (maxSeq == 0) ? 1 : (maxSeq + 1);
+    g_pendingLogCount = lineCount;
     done = 1;
 
     snprintf(g_debugBuf, sizeof(g_debugBuf),
-             "[LOG] Recovery done, nextSeq=%lu\r\n", (unsigned long)g_nextSeq);
+             "[LOG] Recovery done, nextSeq=%lu, pending=%lu\r\n", (unsigned long)g_nextSeq, (unsigned long)g_pendingLogCount);
     UART_Print(g_debugBuf);
 
     return true;
@@ -2124,6 +2181,7 @@ static bool Log_RemoveSeq(uint32_t seqToRemove)
     bool removed   = false;
 
     while (1) {
+        HAL_IWDG_Refresh(&hiwdg);
         // Posisikan ke offset baca
         fr = f_lseek(&f, readPos);
         if (fr != FR_OK) break;
@@ -2163,6 +2221,10 @@ static bool Log_RemoveSeq(uint32_t seqToRemove)
         fr = f_lseek(&f, writePos);
         if (fr == FR_OK) {
             f_truncate(&f);   // truncate di posisi writePos
+        }
+        if (g_pendingLogCount > 0) g_pendingLogCount--;
+        if (seqToRemove == g_lastFailedSeq) {
+            g_lastFailedSeq = 0;
         }
     }
 
@@ -2251,6 +2313,92 @@ static void SD_StatusTask(uint32_t now)
 
     // (Opsional) debug
     // UART_Print("[STATUS] status.json updated\r\n");
+}
+
+static float ParseFloatFromJSON(const char *str, const char *key) {
+    const char *p = strstr(str, key);
+    if (p) {
+        p += strlen(key);
+        return atof(p);
+    }
+    return 0.0f;
+}
+
+static bool Log_ParseJSONToMeasurement(const char *json, Measurement_t *m) {
+    memset(m, 0, sizeof(Measurement_t));
+    if (!JSON_ParseSeqFromLine(json, &m->seq)) return false;
+
+    float temp = ParseFloatFromJSON(json, "\"temp\":");
+    float hum = ParseFloatFromJSON(json, "\"hum\":");
+    m->temp = (int16_t)(temp * 10.0f);
+    m->hum = (int16_t)(hum * 10.0f);
+
+    const char *p = strstr(json, "\"dig_in\":[");
+    if (p) {
+        p += 10;
+        for (int i = 0; i < NUM_INPUTS_TOTAL; i++) {
+            if (*p == '1') m->dig_in |= (1U << i);
+            p++;
+            if (*p == ',') p++;
+            else if (*p == ']') break;
+        }
+    }
+
+    p = strstr(json, "\"an_in\":[");
+    if (p) {
+        p += 9;
+        for (int i = 0; i < NUM_ANALOG; i++) {
+            int val;
+            if (sscanf(p, "%d", &val) == 1) m->an_in[i] = (uint16_t)val;
+            while (*p && *p != ',' && *p != ']') p++;
+            if (*p == ',') p++;
+        }
+    }
+
+    p = strstr(json, "\"q\":[");
+    if (p) {
+        p += 5;
+        for (int i = 0; i < NUM_OUTPUTS; i++) {
+            if (*p == '1') m->q |= (1U << i);
+            p++;
+            if (*p == ',') p++;
+            else if (*p == ']') break;
+        }
+    }
+
+    p = strstr(json, "\"timestamp\":\"");
+    if (p) {
+        p += 13;
+        unsigned int Y, M, D, h, m_time, s;
+        if (sscanf(p, "%04u-%02u-%02uT%02u:%02u:%02uZ", &Y, &M, &D, &h, &m_time, &s) == 6) {
+            m->rtc.year = Y;
+            m->rtc.month = M;
+            m->rtc.day = D;
+            m->rtc.hours = h;
+            m->rtc.minutes = m_time;
+            m->rtc.seconds = s;
+            m->rtc.dayOfWeek = 1;
+        }
+    }
+    return true;
+}
+
+static bool Log_GetFirstPendingMeasurement(Measurement_t *m) {
+    if (!g_sd_mounted) return false;
+    static FIL f;
+    if (f_open(&f, LOG_FILE_NAME, FA_READ | FA_OPEN_EXISTING) != FR_OK) return false;
+
+    static char line[JSON_LINE_MAX];
+    bool found = false;
+    while (f_gets(line, sizeof(line), &f) != NULL) {
+        if (JSON_ParseSeqFromLine(line, &m->seq)) {
+            Log_ParseJSONToMeasurement(line, m);
+            found = true;
+            break;
+        }
+    }
+    f_close(&f);
+    return found;
 }
 
 /* ==================== APPLICATION ==================== */
@@ -2460,45 +2608,30 @@ static void App_HandleAcquisition(uint32_t now)
 
     // 7) Kalau SD ter-mount, simpan ke log.json
     if (g_sd_mounted) {
-        if (!Log_AppendJSON(jsonLine)) {
+        if (Log_AppendJSON(jsonLine)) {
+            g_pendingLogCount++;
+        } else {
             UART_Print("[ACQ] Log append failed\r\n");
-            // Tetap lanjut kirim TLV
+        }
+    } else {
+        // Jika SD tidak ter-mount, pastikan data dikirim langsung bila TX idle
+        if (g_txState == TX_STATE_IDLE) {
+            TX_StartNew(&m);
         }
     }
 
-    // 8) Serahkan ke TX state machine (non-blocking, dgn retry otomatis)
-    //    Data SUDAH aman di log.json dari langkah 7 di atas - kalau
-    //    TX_StartNew menolak karena masih busy, tidak ada data hilang,
-    //    hanya pengiriman ke ESP32 yang tertunda ke siklus berikutnya.
-    TX_StartNew(&m);
-
-    // 9) Naikkan seq
+    // 8) Naikkan seq
     g_nextSeq++;
 }
 
-static void App_HandleAck(void)
-{
-    if (!g_ack_pending) return;
-
-    uint32_t seq = g_ack_seq;
-    g_ack_pending = 0;
-
-    if (!g_sd_mounted) {
-        // Tidak ada log untuk dihapus, cukup info saja
-        snprintf(g_debugBuf, sizeof(g_debugBuf),
-                 "[ACK] seq=%lu (no SD, nothing to remove)\r\n",
-                 (unsigned long)seq);
-        UART_Print(g_debugBuf);
-        return;
+static void UART_ProcessPendingFrame(void) {
+    if (g_deferredFramePending) {
+        OnFrameReceived(g_deferredFrameBuf, g_deferredFrameLen, g_deferredFrameType);
+        g_deferredFramePending = 0;
     }
-
-    bool removed = Log_RemoveSeq(seq);
-
-    snprintf(g_debugBuf, sizeof(g_debugBuf),
-             "[ACK] seq=%lu, removed_from_log=%s\r\n",
-             (unsigned long)seq, removed ? "YES" : "NO");
-    UART_Print(g_debugBuf);
 }
+
+
 
 /* ----------------------------------------------------------------------
    TX_StartNew()
@@ -2564,10 +2697,23 @@ static void TX_Process(uint32_t now)
     switch (g_txState)
     {
     case TX_STATE_IDLE:
-        /* tidak ada TX aktif */
+        if (g_sd_mounted && g_pendingLogCount > 0) {
+            Measurement_t pendingM;
+            if (Log_GetFirstPendingMeasurement(&pendingM)) {
+                if (pendingM.seq == g_lastFailedSeq) {
+                    if ((HAL_GetTick() - g_lastFailedTick) < 5000) {
+                        break; // Tunggu 5 detik sebelum retry data yang gagal
+                    }
+                }
+                TX_StartNew(&pendingM);
+            } else {
+                g_pendingLogCount = 0; // Sinkronisasi jika log kosong tapi count > 0
+            }
+        }
         break;
 
     case TX_STATE_SEND_FRAME:
+        g_ack_pending = 0; // Hapus sisa ACK basi sebelum transmit baru
         if (SendMeasurementTLV(&g_txCtx.measurement))
         {
             g_txCtx.ackDeadlineMs = now + ACK_TIMEOUT_MS;
@@ -2659,6 +2805,9 @@ static void TX_Process(uint32_t now)
                  "[TX] FAILED permanen seq=%lu setelah %u retry, data tetap di log.json\r\n",
                  (unsigned long)g_txCtx.seq, TX_MAX_RETRY);
         UART_Print(g_debugBuf);
+
+        g_lastFailedSeq = g_txCtx.seq;
+        g_lastFailedTick = now;
         g_txState = TX_STATE_IDLE;
         break;
 
@@ -2692,13 +2841,14 @@ static void Debug_PrintMeasurementJSON(const Measurement_t *m, bool byIo)
              m->rtc.year, m->rtc.month, m->rtc.day,
              m->rtc.hours, m->rtc.minutes, m->rtc.seconds);
 
-    // Build dig_in array
+    // Build dig_in array (jumlah channel mengikuti Addon Type aktif)
+    uint8_t digCount = Addon_ActiveInputCount();
     p = digArr;
     *p++ = '[';
-    for (uint8_t i = 0; i < NUM_INPUTS_TOTAL; i++) {
+    for (uint8_t i = 0; i < digCount; i++) {
         uint8_t bit = (m->dig_in & (1U << i)) ? 1 : 0;
         n = snprintf(p, sizeof(digArr) - (p - digArr), "%u%s",
-                     bit, (i < NUM_INPUTS_TOTAL - 1) ? "," : "");
+                     bit, (i < digCount - 1) ? "," : "");
         if (n > 0) p += n;
     }
     *p++ = ']';
