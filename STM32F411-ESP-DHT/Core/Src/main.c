@@ -147,6 +147,37 @@ static WatchdogHealth_t wd;
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+/* ==================== DEBUG CONFIG ====================
+ * Master switch untuk SELURUH log debug/monitoring STM32 (mirror dari
+ * pola #define DEBUG di firmware ESP32). Ini HANYA mengendalikan log
+ * yang keluar lewat UART1 (USB-TTL, dibaca manusia) - TIDAK ada
+ * hubungannya dengan komunikasi TLV STM32<->ESP32 di UART2, yang selalu
+ * jalan normal terlepas dari nilai DEBUG_ENABLE (lihat UART_Print()
+ * vs HAL_UART_Transmit(&huart2, ...) di masing2 fungsi protokol).
+ *
+ *   DEBUG_ENABLE = 1  -> semua log debug aktif, dikirim ke UART1.
+ *   DEBUG_ENABLE = 0  -> seluruh log debug di-strip saat compile time:
+ *                        argumen macro (termasuk snprintf & isinya)
+ *                        TIDAK dievaluasi sama sekali, jadi tidak ada
+ *                        overhead runtime (bukan sekadar if(){} biasa).
+ *
+ * Cara pakai di kode:
+ *   DBG_PRINT("string literal tetap\r\n");
+ *   DBG_PRINTF("format %d %s\r\n", angka, teks);
+ * Gunakan macro ini utk SEMUA log debug baru, jangan panggil
+ * UART_Print()/snprintf(g_debugBuf,...) langsung supaya tetap ikut
+ * ter-strip saat DEBUG_ENABLE = 0. */
+#define DEBUG_ENABLE 1
+
+#if DEBUG_ENABLE
+    #define DBG_PRINT(str)       UART_Print(str)
+    #define DBG_PRINTF(fmt, ...) do { snprintf(g_debugBuf, sizeof(g_debugBuf), fmt, ##__VA_ARGS__); \
+                                       UART_Print(g_debugBuf); } while (0)
+#else
+    #define DBG_PRINT(str)       ((void)0)
+    #define DBG_PRINTF(fmt, ...) ((void)0)
+#endif
+
 /* ==================== TLV FORMAT (UART only) ==================== */
 #define TLV_SOF             0x7E
 
@@ -165,6 +196,8 @@ static WatchdogHealth_t wd;
 #define FRAME_TYPE_RTC      0x04
 #define FRAME_TYPE_ERROR    0x05   // arah STM32 -> ESP32 (laporan error)
 #define FRAME_TYPE_ADDON    0x06   // arah ESP32 -> STM32 (status input addon PCF8574)
+#define FRAME_TYPE_READY       0x07   // arah STM32 -> ESP32: STM32 sudah APP_STATE_RUN, siap terima config
+#define FRAME_TYPE_RULES_ACK   0x08   // arah STM32 -> ESP32: rules sudah di-parse & diterapkan, payload = jumlah rule
 
 /* TLV tags from ESP32 */
 #define TAG_RULE            0x10
@@ -175,6 +208,9 @@ static WatchdogHealth_t wd;
 #define TLV_TAG_ERR_MODULE  0x30   // u8
 #define TLV_TAG_ERR_CODE    0x31   // u8
 #define TLV_TAG_ERR_ACTIVE  0x32   // u8 (1 = error, 0 = clear)
+
+/* TLV tag for FRAME_TYPE_RULES_ACK (STM32 -> ESP32) */
+#define TAG_RULE_COUNT      0x50   // u8, jumlah rule (Q1..Q4) yg berhasil di-parse & diterapkan
 
 /* I2C Addresses */
 #define DS3231_ADDR         (0x68U << 1)
@@ -210,7 +246,21 @@ static WatchdogHealth_t wd;
 #define INPUT_CHANGE_TIME_MS    500U
 #define DELIVERY_TIME_INTERVAL  60000U
 #define TX_MAX_RETRY            3U
-#define ACK_TIMEOUT_MS          5000U
+/* PENTING: nilai ini HARUS lebih besar dari waktu round-trip cloud
+ * terlama yang mungkin dipakai ESP32 (lihat sendByTransport() di
+ * firmware ESP32). Transport GSM+HTTP butuh ~35-40 detik best-case
+ * (HTTPINIT + PARA + prompt + confirm + HTTPACTION 15s + HTTPREAD).
+ * Kalau STM32 timeout (retry) SEBELUM ESP32 sempat membalas ACK,
+ * STM32 akan kirim ulang TLV yang sama sementara ESP32 masih
+ * mem-blocking-proses pengiriman sebelumnya ke cloud -> pengiriman
+ * DUPLIKAT ke cloud untuk seq yang sama. 5000ms lama sekali TIDAK
+ * cukup untuk mode GSM/HTTP. Sesuaikan angka ini dgn transport
+ * TERLAMA yang benar2 dipakai di lapangan; kalau hanya WS/MQTT/TCP
+ * (dengan ACK_TIMEOUT_MS versi ESP32 = 3000ms) nilai lama 5000ms
+ * cukup - tapi untuk instalasi yang memakai mode GSM/HTTP, WAJIB
+ * dinaikkan, dan idempotency di sisi Cloud (dedup by device_id+seq)
+ * tetap wajib ada sebagai lapisan pertahanan terakhir. */
+#define ACK_TIMEOUT_MS          45000U
 
 /* DHT error reporting delay */
 #define DHT_ERROR_ENABLE_DELAY_MS   5000U   // 5 detik setelah boot
@@ -225,6 +275,14 @@ static WatchdogHealth_t wd;
 /* File names*/
 #define LOG_FILE_NAME           "log.json"
 #define STATUS_FILE_NAME        "status.json"
+#define SEQ_FILE_NAME           "seq.dat"      /* counter persisten, independen dari isi queue */
+#define LOG_BAD_FILE_NAME       "log_bad.json" /* karantina baris log.json yang gagal di-parse saat recovery */
+
+/* Emergency RAM buffer - fallback TERAKHIR saat SD tidak ter-mount DAN TX
+ * sedang sibuk (baru bisa terjadi kalau SD memang lepas/rusak). Ini BUKAN
+ * pengganti SD; hanya mencegah 1-2 event terbuang percuma saat window kecil
+ * itu terjadi. Kalau SD kembali mount, isi buffer ini di-flush ke log.json. */
+#define EMERGENCY_BUF_SLOTS     8U
 
 /* USER CODE END PD */
 
@@ -307,11 +365,32 @@ static uint32_t g_pendingLogCount = 0;
 static uint32_t g_lastFailedSeq = 0;
 static uint32_t g_lastFailedTick = 0;
 
-/* Deferred UART Frame Processing */
-static volatile uint8_t g_deferredFramePending = 0;
-static uint8_t g_deferredFrameBuf[UART_FRAME_MAX_LEN];
-static uint16_t g_deferredFrameLen = 0;
-static uint8_t g_deferredFrameType = 0;
+/* Emergency RAM buffer - lihat komentar EMERGENCY_BUF_SLOTS di atas.
+ * HILANG saat power loss (RAM), jadi ini cuma jaring pengaman sekunder;
+ * SD card tetap satu-satunya source of truth resmi. */
+static Measurement_t g_emergencyBuf[EMERGENCY_BUF_SLOTS];
+static uint8_t        g_emergencyCount = 0;
+
+/* Deferred UART Frame Processing - RING BUFFER (bukan 1 slot lagi)
+ * Sebelumnya cuma 1 slot: kalau ada frame baru datang sebelum main loop
+ * sempat memproses frame sebelumnya (mis. saat STM32 masih di
+ * APP_STATE_SD_MOUNT/APP_STATE_LOG_RECOVER dan UART_ProcessPendingFrame()
+ * belum dipanggil), frame itu DIBUANG DIAM-DIAM oleh ISR (lihat guard
+ * `if (!g_deferredFramePending)` yg lama). Ini salah satu penyebab Rules
+ * kadang tidak sampai saat boot bersamaan ESP32+STM32. Sekarang pakai
+ * ring buffer kecil supaya beberapa frame yg datang berdekatan (mis. RULES
+ * lalu RTC saat boot) tidak saling menimpa. */
+#define DEFERRED_FRAME_SLOTS    4U
+typedef struct {
+    uint8_t  buf[UART_FRAME_MAX_LEN];
+    uint16_t len;
+    uint8_t  type;
+} DeferredFrame_t;
+static volatile DeferredFrame_t g_deferredFrames[DEFERRED_FRAME_SLOTS];
+static volatile uint8_t g_deferredHead  = 0; /* index utk pop (main loop) */
+static volatile uint8_t g_deferredTail  = 0; /* index utk push (ISR) */
+static volatile uint8_t g_deferredCount = 0;
+static volatile uint32_t g_deferredDroppedCount = 0; /* diagnostik: ring buffer penuh */
 
 /* Error flags */
 static uint8_t g_err_rtc = 0;
@@ -398,6 +477,8 @@ static size_t TLV_PutU32(uint8_t *buf, uint8_t tag, uint32_t val);
 static size_t TLV_PutU16Array4(uint8_t *buf, uint8_t tag, const uint16_t arr[4]);
 static size_t TLV_EncodeMeasurement(const Measurement_t *m, uint8_t *out, size_t maxLen);
 static void SendErrorTLV(uint8_t mid, uint8_t st, uint8_t ec);
+static void SendReadyTLV(void);
+static void SendRulesAckTLV(uint8_t ruleCount);
 
 /* TLV Parser (from ESP32) */
 static uint32_t TLV_ReadU32BE(const uint8_t *p);
@@ -434,6 +515,11 @@ static void Log_InitRuntime(void);
 static bool SD_MountTask(void);
 static bool Log_RecoverTask(void);
 static bool Log_AppendJSON(const char *jsonLine);
+static bool Seq_LoadPersisted(uint32_t *outSeq);
+static bool Seq_Persist(uint32_t nextSeq);
+static void Log_QuarantineBadLines(void);
+static void Emergency_Push(const Measurement_t *m);
+static void Emergency_FlushToSD(void);
 static void SD_StatusTask(uint32_t now);
 
 /* Application */
@@ -527,13 +613,13 @@ int main(void)
   MX_IWDG_Init();
   /* USER CODE BEGIN 2 */
 
-  UART_Print("\r\n");
-  UART_Print("============================================\r\n");
-  UART_Print("  STM32 IoT Node - TLV/JSON Hybrid v1.0\r\n");
-  UART_Print("  UART Comms : TLV Binary\r\n");
-  UART_Print("  SD Card    : JSON (Human-readable)\r\n");
-  UART_Print("  Debug      : JSON (Human-readable)\r\n");
-  UART_Print("============================================\r\n");
+  DBG_PRINT("\r\n");
+  DBG_PRINT("============================================\r\n");
+  DBG_PRINT("  STM32 IoT Node - TLV/JSON Hybrid v1.0\r\n");
+  DBG_PRINT("  UART Comms : TLV Binary\r\n");
+  DBG_PRINT("  SD Card    : JSON (Human-readable)\r\n");
+  DBG_PRINT("  Debug      : JSON (Human-readable)\r\n");
+  DBG_PRINT("============================================\r\n");
 
   Log_InitRuntime();
   g_appState = APP_STATE_SD_MOUNT;
@@ -566,7 +652,13 @@ int main(void)
               Log_RecoverTask();
           }
           g_appState = APP_STATE_RUN;
-          UART_Print("[APP] Entering RUN state\r\n");
+          DBG_PRINT("[APP] Entering RUN state\r\n");
+          /* STM32 baru sekarang benar2 siap: UART_ProcessPendingFrame()
+             akan mulai dipanggil di iterasi berikutnya. Kabari ESP32
+             lewat handshake FRAME_TYPE_READY, supaya ESP32 tahu KAPAN
+             aman mengirim Rules - bukan lagi menebak pakai delay tetap
+             yg jadi akar penyebab race saat boot bersamaan. */
+          SendReadyTLV();
           break;
 
       case APP_STATE_RUN:
@@ -1491,12 +1583,77 @@ static void SendErrorTLV(uint8_t mid, uint8_t st, uint8_t ec)
     HAL_UART_Transmit(&huart2, frame, fidx, 100);
 }
 
+/* ----------------------------------------------------------------------
+   SendReadyTLV()
+   Dikirim SEKALI oleh STM32 ke ESP32 begitu STM32 benar2 masuk
+   APP_STATE_RUN (SD mount + log recovery selesai, UART draining aktif,
+   siap terima konfigurasi Rules). Ini bagian dari handshake sinkronisasi
+   startup - ESP32 menunggu frame ini SEBELUM mengirim Rules, bukan lagi
+   menebak pakai delay tetap. Payload kosong, keberadaan frame ini sendiri
+   yg jadi sinyal. */
+static void SendReadyTLV(void)
+{
+    uint8_t frame[8];
+    uint16_t fidx = 0;
+
+    frame[fidx++] = TLV_SOF;
+    frame[fidx++] = FRAME_TYPE_READY;
+    frame[fidx++] = 0; // len_h
+    frame[fidx++] = 0; // len_l, payload kosong
+
+    uint16_t crc = CRC16_Modbus(frame, fidx);
+    frame[fidx++] = (crc >> 8) & 0xFF;
+    frame[fidx++] = crc & 0xFF;
+
+    HAL_UART_Transmit(&huart2, frame, fidx, 100);
+    DBG_PRINT("[SYNC] READY dikirim ke ESP32\r\n");
+}
+
+/* ----------------------------------------------------------------------
+   SendRulesAckTLV()
+   Dikirim STM32 -> ESP32 SEGERA setelah ParseRulesTLV() selesai
+   memproses & menerapkan Rules ke g_rules[]. Payload berisi jumlah rule
+   yg berhasil di-parse, supaya ESP32 bisa memvalidasi jumlahnya cocok
+   dgn yg dikirim (mendeteksi kalau ada TLV yg korup/rule yg gagal
+   diparsing tanpa terlihat). Ini menutup requirement "STM32 mengirim
+   ACK bahwa seluruh Rules telah diterapkan" & "validasi jumlah Rules
+   yang diterima sesuai dgn yg dikirim". */
+static void SendRulesAckTLV(uint8_t ruleCount)
+{
+    uint8_t payload[4];
+    size_t idx = 0;
+
+    payload[idx++] = TAG_RULE_COUNT;
+    payload[idx++] = 1;
+    payload[idx++] = ruleCount;
+
+    uint8_t frame[16];
+    uint16_t fidx = 0;
+
+    frame[fidx++] = TLV_SOF;
+    frame[fidx++] = FRAME_TYPE_RULES_ACK;
+    frame[fidx++] = (idx >> 8) & 0xFF;
+    frame[fidx++] = idx & 0xFF;
+
+    memcpy(&frame[fidx], payload, idx);
+    fidx += idx;
+
+    uint16_t crc = CRC16_Modbus(frame, fidx);
+    frame[fidx++] = (crc >> 8) & 0xFF;
+    frame[fidx++] = crc & 0xFF;
+
+    HAL_UART_Transmit(&huart2, frame, fidx, 100);
+
+    DBG_PRINTF(
+             "[SYNC] RULES_ACK dikirim, count=%u\r\n", ruleCount);
+}
+
 static bool SendMeasurementTLV(const Measurement_t *m)
 {
     uint8_t tlvPayload[64];
     size_t tlvLen = TLV_EncodeMeasurement(m, tlvPayload, sizeof(tlvPayload));
     if (tlvLen == 0) {
-        UART_Print("[TX] TLV encode failed\r\n");
+        DBG_PRINT("[TX] TLV encode failed\r\n");
         return false;
     }
 
@@ -1516,14 +1673,13 @@ static bool SendMeasurementTLV(const Measurement_t *m)
     frame[idx++] = crc & 0xFF;
 
     if (HAL_UART_Transmit(&huart2, frame, idx, 200) != HAL_OK) {
-        UART_Print("[TX] UART transmit failed\r\n");
+        DBG_PRINT("[TX] UART transmit failed\r\n");
         return false;
     }
 
-    snprintf(g_debugBuf, sizeof(g_debugBuf),
+    DBG_PRINTF(
              "[TX] Sent TLV seq=%lu len=%u\r\n",
              (unsigned long)m->seq, (unsigned)tlvLen);
-    UART_Print(g_debugBuf);
 
     return true;
 }
@@ -1668,11 +1824,18 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
                 if (crcRecv == crcCalc)
                 {
                     uint8_t frameType = g_frameBuf[1];
-                    if (!g_deferredFramePending) {
-                        memcpy(g_deferredFrameBuf, &g_frameBuf[4], payloadLen);
-                        g_deferredFrameLen = payloadLen;
-                        g_deferredFrameType = frameType;
-                        g_deferredFramePending = 1;
+                    if (g_deferredCount < DEFERRED_FRAME_SLOTS) {
+                        memcpy((void*)g_deferredFrames[g_deferredTail].buf, &g_frameBuf[4], payloadLen);
+                        g_deferredFrames[g_deferredTail].len  = payloadLen;
+                        g_deferredFrames[g_deferredTail].type = frameType;
+                        g_deferredTail = (g_deferredTail + 1) % DEFERRED_FRAME_SLOTS;
+                        g_deferredCount++;
+                    } else {
+                        /* Ring buffer penuh (main loop belum sempat drain -
+                           harusnya sangat jarang dgn 4 slot). Dibuang dgn
+                           jejak counter, BUKAN diam2 tanpa indikasi sama
+                           sekali seperti implementasi lama. */
+                        g_deferredDroppedCount++;
                     }
                 }
 
@@ -1773,6 +1936,7 @@ static void ParseRulesTLV(const uint8_t *tlv, size_t len)
     Rules_Reset();
 
     size_t i = 0;
+    uint8_t parsedCount = 0;
     while (i + 2 <= len) {
         uint8_t tag = tlv[i];
         uint8_t l   = tlv[i + 1];
@@ -1785,12 +1949,18 @@ static void ParseRulesTLV(const uint8_t *tlv, size_t len)
             memcpy(ruleStr, &tlv[i + 2], copyLen);
             ruleStr[copyLen] = '\0';
             ParseOneRuleString(ruleStr);
+            parsedCount++;
         }
 
         i += 2 + l;
     }
 
     g_ruleUpdated = 1;
+
+    /* Beri tahu ESP32 bahwa Rules sudah diterapkan + berapa jumlah yg
+       berhasil diparsing, supaya ESP32 bisa validasi & retry kalau perlu
+       (lihat penjelasan lengkap di SendRulesAckTLV()). */
+    SendRulesAckTLV(parsedCount);
 }
 
 static void ParseRTCTLV(const uint8_t *tlv, size_t len)
@@ -1808,9 +1978,9 @@ static void ParseRTCTLV(const uint8_t *tlv, size_t len)
             EpochToRTC(epoch, &t);
 
             if (DS3231_SetTime(&t)) {
-                UART_Print("[RTC] Set from ESP32 OK\r\n");
+                DBG_PRINT("[RTC] Set from ESP32 OK\r\n");
             } else {
-                UART_Print("[RTC] Set FAILED\r\n");
+                DBG_PRINT("[RTC] Set FAILED\r\n");
             }
         }
 
@@ -1831,9 +2001,8 @@ static void ParseACKTLV(const uint8_t *tlv, size_t len)
             g_ack_seq = TLV_ReadU32BE(&tlv[i + 2]);
             g_ack_pending = 1;
 
-            snprintf(g_debugBuf, sizeof(g_debugBuf),
+            DBG_PRINTF(
                      "[ACK] Received seq=%lu\r\n", (unsigned long)g_ack_seq);
-            UART_Print(g_debugBuf);
         }
 
         i += 2 + l;
@@ -1882,10 +2051,9 @@ static void ParseAddonTLV(const uint8_t *tlv, size_t len)
             if (!g_addonExpansionActive)
             {
                 g_addonExpansionActive = 1;
-                snprintf(g_debugBuf, sizeof(g_debugBuf),
+                DBG_PRINTF(
                          "[ADDON] Expansion Input terdeteksi aktif, Digital Input = %u channel\r\n",
                          (unsigned)NUM_INPUTS_TOTAL);
-                UART_Print(g_debugBuf);
             }
 
             if (newAddonMask != g_addonInputMask)
@@ -1893,10 +2061,9 @@ static void ParseAddonTLV(const uint8_t *tlv, size_t len)
                 g_addonInputMask = newAddonMask;
                 RecomputeCombinedInputMask();
 
-                snprintf(g_debugBuf, sizeof(g_debugBuf),
+                DBG_PRINTF(
                          "[ADDON] mask updated from ESP32: 0x%02X\r\n",
                          newAddonMask);
-                UART_Print(g_debugBuf);
             }
         }
 
@@ -1955,7 +2122,11 @@ static void ApplyRules(uint32_t inputMask)
 
 static void PrintRuleStatus(void)
 {
-    UART_Print("[RULE] Current configuration:\r\n");
+    /* Fungsi ini murni debug/monitoring (dump status rule ke UART1),
+     * bukan bagian protokol - seluruh isi di-strip saat DEBUG_ENABLE=0
+     * supaya loop & snprintf increment di bawah juga tidak jalan sia-sia. */
+#if DEBUG_ENABLE
+    DBG_PRINT("[RULE] Current configuration:\r\n");
 
     for (int q = 0; q < NUM_OUTPUTS; q++)
     {
@@ -1978,13 +2149,13 @@ static void PrintRuleStatus(void)
         snprintf(g_debugBuf + len, sizeof(g_debugBuf) - len, ")\r\n");
         UART_Print(g_debugBuf);
     }
+#endif
 }
 
 static void OnFrameReceived(uint8_t *payload, uint16_t len, uint8_t frameType)
 {
-    snprintf(g_debugBuf, sizeof(g_debugBuf),
+    DBG_PRINTF(
              "[RX] Frame type=0x%02X len=%u\r\n", frameType, len);
-    UART_Print(g_debugBuf);
 
     switch (frameType) {
         case FRAME_TYPE_RULES:
@@ -2008,7 +2179,7 @@ static void OnFrameReceived(uint8_t *payload, uint16_t len, uint8_t frameType)
             break;
 
         default:
-            UART_Print("[RX] Unknown frame type\r\n");
+            DBG_PRINT("[RX] Unknown frame type\r\n");
             break;
     }
 }
@@ -2046,7 +2217,8 @@ static bool SD_MountTask(void)
             Debug_ErrorJson(MOD_SD, ST_OK, ERR_NONE);
             SendErrorTLV(MOD_SD, ST_OK, ERR_NONE);
         }
-        UART_Print("[SD] Mounted OK\r\n");
+        DBG_PRINT("[SD] Mounted OK\r\n");
+        Emergency_FlushToSD();
         return true;
     } else {
         if (!g_err_sd) {
@@ -2058,12 +2230,191 @@ static bool SD_MountTask(void)
         // Hanya print kalau kode error berubah
         if (fr != lastFr) {
             lastFr = fr;
-            snprintf(g_debugBuf, sizeof(g_debugBuf),
+            DBG_PRINTF(
                      "[SD] Mount ERR=%d\r\n", fr);
-            UART_Print(g_debugBuf);
         }
     }
     return false;
+}
+
+/* ----------------------------------------------------------------------
+   Seq_LoadPersisted() / Seq_Persist()
+
+   Counter sequence number DISIMPAN TERPISAH dari isi queue (seq.dat),
+   bukan diturunkan semata-mata dari baris yang masih pending di
+   log.json. Alasan: begitu semua event ter-ACK dan log.json kosong
+   (kondisi NORMAL saat koneksi cloud lancar), scan log.json akan
+   selalu menghasilkan maxSeq=0 -> next=1, sehingga nomor urut kembali
+   dari awal padahal cloud sudah punya histori jauh di depan. seq.dat
+   menjamin monotonic counter tetap benar walau queue kosong;
+   log.json tetap dipakai sbg cross-check kedua (fallback) kalau
+   seq.dat hilang/corrupt/kartu SD diganti.
+   ---------------------------------------------------------------------- */
+static bool Seq_LoadPersisted(uint32_t *outSeq)
+{
+    FIL f;
+    if (f_open(&f, SEQ_FILE_NAME, FA_READ | FA_OPEN_EXISTING) != FR_OK) {
+        return false;
+    }
+
+    char buf[16] = {0};
+    UINT br = 0;
+    FRESULT fr = f_read(&f, buf, sizeof(buf) - 1, &br);
+    f_close(&f);
+
+    if (fr != FR_OK || br == 0) {
+        return false;
+    }
+
+    buf[br] = '\0';
+    uint32_t val = (uint32_t)strtoul(buf, NULL, 10);
+    if (val == 0) {
+        return false; /* file kosong/corrupt dianggap tidak valid */
+    }
+
+    *outSeq = val;
+    return true;
+}
+
+static bool Seq_Persist(uint32_t nextSeq)
+{
+    FIL f;
+    FRESULT fr = f_open(&f, SEQ_FILE_NAME, FA_WRITE | FA_CREATE_ALWAYS);
+    if (fr != FR_OK) {
+        DBG_PRINT("[SEQ] persist open failed\r\n");
+        return false;
+    }
+
+    char buf[16];
+    int len = snprintf(buf, sizeof(buf), "%lu", (unsigned long)nextSeq);
+    UINT bw = 0;
+    fr = f_write(&f, buf, (UINT)len, &bw);
+    f_sync(&f);
+    f_close(&f);
+
+    if (fr != FR_OK || (int)bw != len) {
+        DBG_PRINT("[SEQ] persist write failed\r\n");
+        return false;
+    }
+    return true;
+}
+
+/* ----------------------------------------------------------------------
+   Log_QuarantineBadLines()
+
+   Baris di log.json yang gagal di-parse (mis. akibat torn write saat
+   power loss persis di tengah f_write) SEBELUMNYA hanya di-skip diam2
+   oleh Log_GetFirstPendingMeasurement()/Log_RemoveSeq() - baris itu
+   tidak pernah terkirim, tidak pernah dihapus, dan event di dalamnya
+   HILANG PERMANEN tanpa ada peringatan ke operator.
+
+   Fungsi ini dipanggil sekali saat recovery: baris valid ditulis balik
+   ke log.json, baris yang gagal parse dipindah ke log_bad.json supaya
+   masih bisa diaudit manual, dan error dilaporkan ke ESP32/UART supaya
+   kejadian ini TIDAK diam-diam.
+   ---------------------------------------------------------------------- */
+static void Log_QuarantineBadLines(void)
+{
+    FIL src, dstGood, dstBad;
+    if (f_open(&src, LOG_FILE_NAME, FA_READ | FA_OPEN_EXISTING) != FR_OK) {
+        return;
+    }
+    if (f_open(&dstGood, "log_tmp.json", FA_WRITE | FA_CREATE_ALWAYS) != FR_OK) {
+        f_close(&src);
+        return;
+    }
+    if (f_open(&dstBad, LOG_BAD_FILE_NAME, FA_WRITE | FA_OPEN_APPEND) != FR_OK) {
+        f_close(&src);
+        f_close(&dstGood);
+        return;
+    }
+
+    char line[JSON_LINE_MAX];
+    uint32_t seq;
+    uint32_t badCount = 0;
+    UINT bw;
+
+    while (f_gets(line, sizeof(line), &src) != NULL) {
+        HAL_IWDG_Refresh(&hiwdg);
+        size_t len = strlen(line);
+        if (JSON_ParseSeqFromLine(line, &seq)) {
+            f_write(&dstGood, line, len, &bw);
+        } else if (len > 1) {
+            /* line > 1 char supaya baris kosong/newline sisa tidak dianggap "bad" */
+            f_write(&dstBad, line, len, &bw);
+            badCount++;
+        }
+    }
+
+    f_sync(&dstGood);
+    f_sync(&dstBad);
+    f_close(&src);
+    f_close(&dstGood);
+    f_close(&dstBad);
+
+    if (badCount > 0) {
+        DBG_PRINTF(
+                 "[LOG] %lu baris korup dikarantina ke %s\r\n",
+                 (unsigned long)badCount, LOG_BAD_FILE_NAME);
+        SendErrorTLV(MOD_SD, ST_ERR, ERR_CRC);
+    }
+
+    /* Ganti log.json dengan versi bersih (hasil rewrite) */
+    f_unlink(LOG_FILE_NAME);
+    f_rename("log_tmp.json", LOG_FILE_NAME);
+}
+
+/* ----------------------------------------------------------------------
+   Emergency_Push() / Emergency_FlushToSD()
+
+   Fallback TERAKHIR: kejadian ini hanya bisa muncul saat SD TIDAK
+   ter-mount (kartu lepas/rusak) DAN TX_Process sedang sibuk mengurus
+   event lain (retry) di saat yang sama. Sebelumnya kombinasi ini
+   membuat event baru terbuang total tanpa jejak di manapun (lihat
+   TX_StartNew: kalau state != IDLE, event ditolak; kalau SD juga tidak
+   mounted, tidak ada log.json untuk menampungnya). Buffer RAM kecil ini
+   menahan event tsb sementara, dan begitu SD kembali ter-mount akan
+   di-flush jadi baris log.json biasa (lewat jalur normal, ikut serta
+   dalam scan Seq/queue seperti event lainnya).
+
+   CATATAN: ini RAM, jadi tetap hilang kalau restart terjadi SEBELUM SD
+   kembali. Bukan pengganti SD - hanya menutup celah kecil, bukan
+   solusi utama. Kalau buffer penuh (SD mati berkepanjangan), event
+   terlama sengaja di-drop dengan log eksplisit (bukan diam2), supaya
+   operator sadar kartu SD perlu segera ditangani.
+   ---------------------------------------------------------------------- */
+static void Emergency_Push(const Measurement_t *m)
+{
+    if (g_emergencyCount >= EMERGENCY_BUF_SLOTS) {
+        DBG_PRINTF(
+                 "[EMERGENCY] buffer penuh, seq=%lu DIBUANG (SD mati terlalu lama!)\r\n",
+                 (unsigned long)m->seq);
+        return;
+    }
+    g_emergencyBuf[g_emergencyCount++] = *m;
+    DBG_PRINTF(
+             "[EMERGENCY] seq=%lu ditahan di RAM (SD tidak mounted, TX busy) [%u/%u]\r\n",
+             (unsigned long)m->seq, g_emergencyCount, EMERGENCY_BUF_SLOTS);
+}
+
+static void Emergency_FlushToSD(void)
+{
+    if (g_emergencyCount == 0 || !g_sd_mounted) return;
+
+    for (uint8_t i = 0; i < g_emergencyCount; i++) {
+        char jsonLine[JSON_LINE_MAX];
+        size_t jsonLen = JSON_EncodeMeasurement(&g_emergencyBuf[i], jsonLine, sizeof(jsonLine));
+        if (jsonLen > 0 && Log_AppendJSON(jsonLine)) {
+            g_pendingLogCount++;
+        } else {
+            DBG_PRINT("[EMERGENCY] flush ke log.json gagal, data tetap di RAM\r\n");
+            return; /* jangan hapus dari buffer kalau gagal tulis */
+        }
+    }
+
+    DBG_PRINTF(
+             "[EMERGENCY] %u event berhasil di-flush ke log.json\r\n", g_emergencyCount);
+    g_emergencyCount = 0;
 }
 
 static bool Log_RecoverTask(void)
@@ -2081,39 +2432,70 @@ static bool Log_RecoverTask(void)
         // Buat file kosong
         fr = f_open(&file, LOG_FILE_NAME, FA_WRITE | FA_CREATE_ALWAYS);
         if (fr != FR_OK) {
-            UART_Print("[LOG] create log.json failed\r\n");
+            DBG_PRINT("[LOG] create log.json failed\r\n");
             return false;
         }
         f_close(&file);
-        g_nextSeq = 1;
-        done = 1;
-        return true;
+    } else {
+        f_close(&file);
+        // Karantina dulu baris yang gagal parse (torn write dsb), supaya
+        // event korup tidak diam2 hilang & tidak ikut mengacaukan scan seq.
+        Log_QuarantineBadLines();
     }
 
-    // Scan untuk mencari seq maksimum
+    // Scan log.json (yg sudah bersih, atau memang baru dibuat kosong)
+    // untuk mencari seq maksimum yang masih pending.
     char line[JSON_LINE_MAX];
     uint32_t seq;
     uint32_t maxSeq = 0;
     uint32_t lineCount = 0;
 
-    while (f_gets(line, sizeof(line), &file) != NULL) {
-        HAL_IWDG_Refresh(&hiwdg);
-        if (JSON_ParseSeqFromLine(line, &seq)) {
-            if (seq > maxSeq) maxSeq = seq;
-            lineCount++;
+    fr = f_open(&file, LOG_FILE_NAME, FA_READ | FA_OPEN_EXISTING);
+    if (fr == FR_OK) {
+        while (f_gets(line, sizeof(line), &file) != NULL) {
+            HAL_IWDG_Refresh(&hiwdg);
+            if (JSON_ParseSeqFromLine(line, &seq)) {
+                if (seq > maxSeq) maxSeq = seq;
+                lineCount++;
+            }
         }
+        f_close(&file);
     }
-
-    f_close(&file);
-
-    g_nextSeq = (maxSeq == 0) ? 1 : (maxSeq + 1);
     g_pendingLogCount = lineCount;
+
+    /* ---- Sumber kebenaran GANDA untuk next-seq ----
+       1) seq.dat  : counter persisten independen dari isi queue. Ini
+                     yg menjamin monotonic tetap benar walau log.json
+                     KOSONG (semua event sudah ter-ACK - kondisi
+                     NORMAL, bukan edge case langka).
+       2) log.json : fallback kalau seq.dat hilang/corrupt/kartu SD
+                     baru/diganti. Juga jaring pengaman kalau seq.dat
+                     sempat ketinggalan (mis. crash tepat sebelum
+                     Seq_Persist tapi sesudah Log_AppendJSON).
+       next-seq final = MAX dari kedua sumber - tidak pernah mundur. */
+    uint32_t fromCounterFile = 0;
+    bool haveCounterFile = Seq_LoadPersisted(&fromCounterFile);
+    uint32_t fromLog = (maxSeq == 0) ? 0 : (maxSeq + 1);
+
+    uint32_t resolved = haveCounterFile ? fromCounterFile : 0;
+    if (fromLog > resolved) resolved = fromLog;
+    if (resolved == 0) resolved = 1;
+
+    g_nextSeq = resolved;
+
+    /* Selalu tulis ulang seq.dat dgn nilai yg sudah diresolusi, supaya
+       file ini konsisten lagi kalau tadi hilang/corrupt/ketinggalan. */
+    Seq_Persist(g_nextSeq);
+
+    DBG_PRINTF(
+             "[LOG] Recovery done, nextSeq=%lu (counter_file=%s val=%lu, log_max+1=%lu), pending=%lu\r\n",
+             (unsigned long)g_nextSeq,
+             haveCounterFile ? "OK" : "MISSING",
+             (unsigned long)fromCounterFile,
+             (unsigned long)fromLog,
+             (unsigned long)g_pendingLogCount);
+
     done = 1;
-
-    snprintf(g_debugBuf, sizeof(g_debugBuf),
-             "[LOG] Recovery done, nextSeq=%lu, pending=%lu\r\n", (unsigned long)g_nextSeq, (unsigned long)g_pendingLogCount);
-    UART_Print(g_debugBuf);
-
     return true;
 }
 
@@ -2122,7 +2504,7 @@ static bool Log_AppendJSON(const char *jsonLine)
     FIL f;
     FRESULT fr = f_open(&f, LOG_FILE_NAME, FA_WRITE | FA_OPEN_APPEND);
     if (fr != FR_OK) {
-        UART_Print("[LOG] Open failed\r\n");
+        DBG_PRINT("[LOG] Open failed\r\n");
         if (!g_err_sd) {
             g_err_sd = 1;
             Debug_ErrorJson(MOD_SD, ST_ERR, ERR_NOT_FOUND);
@@ -2141,7 +2523,7 @@ static bool Log_AppendJSON(const char *jsonLine)
     f_close(&f);
 
     if (fr != FR_OK || bw != len) {
-        UART_Print("[LOG] Write failed\r\n");
+        DBG_PRINT("[LOG] Write failed\r\n");
         if (!g_err_sd) {
             g_err_sd = 1;
             Debug_ErrorJson(MOD_SD, ST_ERR, ERR_CRC);   // treat as data error
@@ -2167,7 +2549,7 @@ static bool Log_RemoveSeq(uint32_t seqToRemove)
     FIL f;
     FRESULT fr = f_open(&f, LOG_FILE_NAME, FA_READ | FA_WRITE);
     if (fr != FR_OK) {
-        UART_Print("[LOG] Open for remove failed\r\n");
+        DBG_PRINT("[LOG] Open for remove failed\r\n");
         f_mount(NULL, (TCHAR const*)USERPath, 0);
         g_sd_mounted = 0;
         return false;
@@ -2209,7 +2591,7 @@ static bool Log_RemoveSeq(uint32_t seqToRemove)
         size_t len = strlen(line);
         fr = f_write(&f, line, len, &bw);
         if (fr != FR_OK || bw != len) {
-            UART_Print("[LOG] write during remove failed\r\n");
+            DBG_PRINT("[LOG] write during remove failed\r\n");
             break;
         }
 
@@ -2275,7 +2657,7 @@ static void SD_StatusTask(uint32_t now)
     FIL f;
     FRESULT fr = f_open(&f, STATUS_FILE_NAME, FA_WRITE | FA_CREATE_ALWAYS);
     if (fr != FR_OK) {
-        UART_Print("[STATUS] Open status.json failed\r\n");
+        DBG_PRINT("[STATUS] Open status.json failed\r\n");
         if (!g_err_sd) {
             g_err_sd = 1;
             Debug_ErrorJson(MOD_SD, ST_ERR, ERR_NOT_FOUND);
@@ -2293,7 +2675,7 @@ static void SD_StatusTask(uint32_t now)
     f_close(&f);
 
     if (fr != FR_OK || bw != (UINT)len) {
-        UART_Print("[STATUS] Write status.json failed\r\n");
+        DBG_PRINT("[STATUS] Write status.json failed\r\n");
         if (!g_err_sd) {
             g_err_sd = 1;
             Debug_ErrorJson(MOD_SD, ST_ERR, ERR_CRC);
@@ -2599,7 +2981,7 @@ static void App_HandleAcquisition(uint32_t now)
     char  jsonLine[JSON_LINE_MAX];
     size_t jsonLen = JSON_EncodeMeasurement(&m, jsonLine, sizeof(jsonLine));
     if (jsonLen == 0) {
-        UART_Print("[ACQ] JSON encode failed\r\n");
+        DBG_PRINT("[ACQ] JSON encode failed\r\n");
         return;
     }
 
@@ -2611,23 +2993,51 @@ static void App_HandleAcquisition(uint32_t now)
         if (Log_AppendJSON(jsonLine)) {
             g_pendingLogCount++;
         } else {
-            UART_Print("[ACQ] Log append failed\r\n");
+            DBG_PRINT("[ACQ] Log append failed\r\n");
         }
     } else {
-        // Jika SD tidak ter-mount, pastikan data dikirim langsung bila TX idle
+        // SD tidak ter-mount: kalau TX idle, kirim langsung.
+        // Kalau TX SEDANG SIBUK (mis. masih retry event lain), event ini
+        // sebelumnya HILANG TOTAL tanpa jejak (tidak masuk log krn SD mati,
+        // ditolak TX_StartNew krn busy). Sekarang ditahan dulu di buffer
+        // RAM darurat, di-flush ke log.json begitu SD kembali ter-mount.
         if (g_txState == TX_STATE_IDLE) {
             TX_StartNew(&m);
+        } else {
+            Emergency_Push(&m);
         }
     }
 
-    // 8) Naikkan seq
+    // 8) Naikkan seq + persist counter (independen dari isi queue,
+    //    lihat penjelasan di Seq_Persist()). Frekuensi rendah (per
+    //    perubahan IO / tiap 60s) jadi aman utk wear SD card.
     g_nextSeq++;
+    Seq_Persist(g_nextSeq);
 }
 
 static void UART_ProcessPendingFrame(void) {
-    if (g_deferredFramePending) {
-        OnFrameReceived(g_deferredFrameBuf, g_deferredFrameLen, g_deferredFrameType);
-        g_deferredFramePending = 0;
+    /* Kuras semua slot yg tersedia tiap panggilan (maks DEFERRED_FRAME_SLOTS,
+       jumlahnya kecil jadi aman dari sisi waktu eksekusi). Ini memastikan
+       kalau beberapa frame sempat menumpuk saat boot (SD_MOUNT/LOG_RECOVER),
+       begitu APP_STATE_RUN tercapai semuanya langsung diproses berurutan,
+       bukan cuma 1 per loop iterasi. */
+    while (g_deferredCount > 0) {
+        uint8_t idx = g_deferredHead;
+        OnFrameReceived((uint8_t*)g_deferredFrames[idx].buf,
+                        g_deferredFrames[idx].len,
+                        g_deferredFrames[idx].type);
+        g_deferredHead = (g_deferredHead + 1) % DEFERRED_FRAME_SLOTS;
+
+        __disable_irq();
+        g_deferredCount--;
+        __enable_irq();
+    }
+
+    if (g_deferredDroppedCount > 0) {
+        DBG_PRINTF(
+                 "[UART] %lu frame dibuang (ring buffer sempat penuh)\r\n",
+                 (unsigned long)g_deferredDroppedCount);
+        g_deferredDroppedCount = 0;
     }
 }
 
@@ -2651,10 +3061,9 @@ static void TX_StartNew(const Measurement_t *m)
 {
     if (g_txState != TX_STATE_IDLE)
     {
-        snprintf(g_debugBuf, sizeof(g_debugBuf),
+        DBG_PRINTF(
                  "[TX] busy (state=%d), seq=%lu tetap di log.json, kirim ditunda\r\n",
                  (int)g_txState, (unsigned long)m->seq);
-        UART_Print(g_debugBuf);
         return;
     }
 
@@ -2744,10 +3153,9 @@ static void TX_Process(uint32_t now)
         }
         else if ((int32_t)(now - g_txCtx.ackDeadlineMs) >= 0)
         {
-            snprintf(g_debugBuf, sizeof(g_debugBuf),
+            DBG_PRINTF(
                      "[TX] ACK timeout seq=%lu\r\n",
                      (unsigned long)g_txCtx.seq);
-            UART_Print(g_debugBuf);
             g_txState = TX_STATE_RETRY_OR_FAIL;
         }
         /* kalau ACK datang dengan seq BERBEDA dari yang ditunggu,
@@ -2762,17 +3170,15 @@ static void TX_Process(uint32_t now)
         if (g_sd_mounted)
         {
             bool removed = Log_RemoveSeq(g_txCtx.seq);
-            snprintf(g_debugBuf, sizeof(g_debugBuf),
+            DBG_PRINTF(
                      "[TX] ACK OK seq=%lu, log_removed=%s\r\n",
                      (unsigned long)g_txCtx.seq, removed ? "YES" : "NO");
-            UART_Print(g_debugBuf);
         }
         else
         {
-            snprintf(g_debugBuf, sizeof(g_debugBuf),
+            DBG_PRINTF(
                      "[TX] ACK OK seq=%lu (no SD mounted)\r\n",
                      (unsigned long)g_txCtx.seq);
-            UART_Print(g_debugBuf);
         }
         g_txState = TX_STATE_IDLE;
         break;
@@ -2781,11 +3187,10 @@ static void TX_Process(uint32_t now)
         g_txCtx.retryCount++;
         if (g_txCtx.retryCount < TX_MAX_RETRY)
         {
-            snprintf(g_debugBuf, sizeof(g_debugBuf),
+            DBG_PRINTF(
                      "[TX] retry %u/%u seq=%lu\r\n",
                      g_txCtx.retryCount, TX_MAX_RETRY,
                      (unsigned long)g_txCtx.seq);
-            UART_Print(g_debugBuf);
             g_txState = TX_STATE_SEND_FRAME;
         }
         else
@@ -2801,10 +3206,9 @@ static void TX_Process(uint32_t now)
            Kembali ke IDLE supaya measurement BERIKUTNYA (siklus
            App_HandleAcquisition selanjutnya) tidak ikut tersumbat
            oleh kegagalan yang sudah permanen ini. */
-        snprintf(g_debugBuf, sizeof(g_debugBuf),
+        DBG_PRINTF(
                  "[TX] FAILED permanen seq=%lu setelah %u retry, data tetap di log.json\r\n",
                  (unsigned long)g_txCtx.seq, TX_MAX_RETRY);
-        UART_Print(g_debugBuf);
 
         g_lastFailedSeq = g_txCtx.seq;
         g_lastFailedTick = now;
@@ -2820,15 +3224,22 @@ static void TX_Process(uint32_t now)
 /* ==================== DEBUG ==================== */
 static void Debug_ErrorJson(uint8_t mid, uint8_t st, uint8_t ec)
 {
+#if DEBUG_ENABLE
     // Format baru: {"mid":1,"st":1,"ec":2}
-    snprintf(g_debugBuf, sizeof(g_debugBuf),
+    DBG_PRINTF(
              "[ERR]{\"mid\":%u,\"st\":%u,\"ec\":%u}\r\n",
              mid, st, ec);
-    UART_Print(g_debugBuf);
+#else
+    (void)mid; (void)st; (void)ec;
+#endif
 }
 
 static void Debug_PrintMeasurementJSON(const Measurement_t *m, bool byIo)
 {
+    /* Fungsi ini murni dump JSON measurement ke UART1 utk monitoring
+     * manusia (SD & TLV protokol dienkode terpisah, lihat JSON_EncodeMeasurement
+     * & TLV_EncodeMeasurement) - seluruh isi di-strip saat DEBUG_ENABLE=0. */
+#if DEBUG_ENABLE
     char ts[32];
     char digArr[64];
     char anArr[32];
@@ -2872,7 +3283,7 @@ static void Debug_PrintMeasurementJSON(const Measurement_t *m, bool byIo)
 
     const char *src = byIo ? "[ACQ][IO] " : "[ACQ][TMR] ";
 
-    snprintf(g_debugBuf, sizeof(g_debugBuf),
+    DBG_PRINTF(
         "%s{\"timestamp\":\"%s\",\"env\":{\"temp\":%.1f,\"hum\":%.1f},"
         "\"dig_in\":%s,\"an_in\":%s,\"q\":%s,\"seq\":%lu}\r\n",
         src, ts,
@@ -2880,18 +3291,22 @@ static void Debug_PrintMeasurementJSON(const Measurement_t *m, bool byIo)
         digArr, anArr, qArr,
         (unsigned long)m->seq
     );
-
-    UART_Print(g_debugBuf);
+#else
+    (void)m; (void)byIo;
+#endif
 }
 
 /* ==================== TLV DEBUG DUMP ==================== */
 static void Debug_DumpTLV(const char *prefix, const uint8_t *tlv, size_t len)
 {
+    /* Dump isi TLV mentah ke UART1 (dipakai opsional saat RX frame utk
+     * troubleshooting - lihat pemanggilan yg di-comment di OnFrameReceived()).
+     * Seluruh isi di-strip saat DEBUG_ENABLE=0. */
+#if DEBUG_ENABLE
     size_t i = 0;
 
-    snprintf(g_debugBuf, sizeof(g_debugBuf),
+    DBG_PRINTF(
              "%s TLV dump, len=%u\r\n", prefix, (unsigned)len);
-    UART_Print(g_debugBuf);
 
     while (i + 2 <= len)
     {
@@ -2900,10 +3315,9 @@ static void Debug_DumpTLV(const char *prefix, const uint8_t *tlv, size_t len)
         i += 2;
 
         if (i + l > len) {
-            snprintf(g_debugBuf, sizeof(g_debugBuf),
+            DBG_PRINTF(
                      "%s  !! malformed TLV (tag=0x%02X, len=%u, remaining=%u)\r\n",
                      prefix, tag, l, (unsigned)(len - (i - 2)));
-            UART_Print(g_debugBuf);
             break;
         }
 
@@ -2919,72 +3333,66 @@ static void Debug_DumpTLV(const char *prefix, const uint8_t *tlv, size_t len)
         /* Interpretasi tag yang dikenal */
         if (tag == TLV_TAG_SEQ && l == 4) {
             uint32_t seq = TLV_ReadU32BE(&tlv[i]);
-            snprintf(g_debugBuf, sizeof(g_debugBuf),
+            DBG_PRINTF(
                      "%s    -> SEQ = %lu\r\n",
                      prefix, (unsigned long)seq);
-            UART_Print(g_debugBuf);
         }
         else if (tag == TLV_TAG_TIMESTAMP && l == 4) {
             uint32_t ts = TLV_ReadU32BE(&tlv[i]);
-            snprintf(g_debugBuf, sizeof(g_debugBuf),
+            DBG_PRINTF(
                      "%s    -> TIMESTAMP = %lu (epoch)\r\n",
                      prefix, (unsigned long)ts);
-            UART_Print(g_debugBuf);
         }
         else if (tag == TLV_TAG_TEMP && l == 2) {
             int16_t t = (int16_t)(((uint16_t)tlv[i] << 8) | tlv[i + 1]);
-            snprintf(g_debugBuf, sizeof(g_debugBuf),
+            DBG_PRINTF(
                      "%s    -> TEMP = %.1f C\r\n",
                      prefix, t / 10.0f);
-            UART_Print(g_debugBuf);
         }
         else if (tag == TLV_TAG_HUM && l == 2) {
             int16_t h = (int16_t)(((uint16_t)tlv[i] << 8) | tlv[i + 1]);
-            snprintf(g_debugBuf, sizeof(g_debugBuf),
+            DBG_PRINTF(
                      "%s    -> HUM  = %.1f %%\r\n",
                      prefix, h / 10.0f);
-            UART_Print(g_debugBuf);
         }
         else if (tag == TLV_TAG_DIG_IN && l == 2) {
             uint16_t dig = ((uint16_t)tlv[i] << 8) | tlv[i + 1];
-            snprintf(g_debugBuf, sizeof(g_debugBuf),
+            DBG_PRINTF(
                      "%s    -> DIG_IN mask = 0x%04X\r\n",
                      prefix, dig);
-            UART_Print(g_debugBuf);
         }
         else if (tag == TLV_TAG_AN_IN && l == 8) {
             uint16_t an[4];
             for (int ch = 0; ch < 4; ch++) {
                 an[ch] = ((uint16_t)tlv[i + ch*2] << 8) | tlv[i + ch*2 + 1];
             }
-            snprintf(g_debugBuf, sizeof(g_debugBuf),
+            DBG_PRINTF(
                      "%s    -> AN_IN = [%u,%u,%u,%u]\r\n",
                      prefix, an[0], an[1], an[2], an[3]);
-            UART_Print(g_debugBuf);
         }
         else if (tag == TLV_TAG_Q && l == 1) {
             uint8_t q = tlv[i];
-            snprintf(g_debugBuf, sizeof(g_debugBuf),
+            DBG_PRINTF(
                      "%s    -> Q mask = 0x%02X\r\n",
                      prefix, q);
-            UART_Print(g_debugBuf);
         }
         else if (tag == TAG_RULE) {   // dari ESP32
-            snprintf(g_debugBuf, sizeof(g_debugBuf),
+            DBG_PRINTF(
                      "%s    -> RULE string: \"%.*s\"\r\n",
                      prefix, l, (const char *)&tlv[i]);
-            UART_Print(g_debugBuf);
         }
         else if (tag == TAG_RTC_TS && l == 4) {
             uint32_t epoch = TLV_ReadU32BE(&tlv[i]);
-            snprintf(g_debugBuf, sizeof(g_debugBuf),
+            DBG_PRINTF(
                      "%s    -> RTC EPOCH = %lu\r\n",
                      prefix, (unsigned long)epoch);
-            UART_Print(g_debugBuf);
         }
 
         i += l;
     }
+#else
+    (void)prefix; (void)tlv; (void)len;
+#endif
 }
 
 static void WD_Service(void)

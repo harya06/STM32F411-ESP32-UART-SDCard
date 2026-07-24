@@ -8,7 +8,7 @@
   },
 
   "network": {
-    "mode": "wifi",
+    "mode": "ethernet",
     "priority": "wifi"
   },
 

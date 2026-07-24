@@ -1,6 +1,7 @@
 // ================== INCLUDES ==================
 #include <Arduino.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 #include <ArduinoJson.h>
 #include <BLEDevice.h>
 #include <BLEUtils.h>
@@ -86,13 +87,13 @@ constexpr size_t BLE_TX_DATA_LEN = (BLE_CHUNK_SIZE > BLE_TX_PREFIX_RESERVE)
                                      ? (BLE_CHUNK_SIZE - BLE_TX_PREFIX_RESERVE)
                                      : 1;
 constexpr unsigned long BLE_TX_INTERVAL_MS = 15;
-constexpr unsigned long BLE_RX_TIMEOUT_MS = 5000;  // reset kalau transfer RX macet di tengah
+constexpr unsigned long BLE_RX_TIMEOUT_MS = 5000;  // reset kalau transfer RX
 
 // ================== PIN CONFIG ==================
 #define PIN_MOSI 23
 #define PIN_MISO 19
 #define PIN_SCK 18
-#define PIN_CS_W5500 2
+#define PIN_CS_W5500 15
 #define PIN_W5500_RST 4
 #define BTN_PIN 32
 #define RXD2 16
@@ -120,7 +121,7 @@ inline void ledWrite(uint8_t pin, bool on) {
 
 // ================== ADDON: EKSPANSI INPUT (PCF8574) ==================
 #define ADDON_POLL_INTERVAL_MS 200
-#define ADDON_DEBOUNCE_MS 500 
+#define ADDON_DEBOUNCE_MS 500
 
 // ================== STM32 FRAME ==================
 #define SOF_BYTE 0x7E
@@ -136,6 +137,9 @@ inline void ledWrite(uint8_t pin, bool on) {
 #define TYPE_RULES 0x03
 #define TYPE_RTC 0x04
 #define TYPE_ADDON 0x06
+#define TYPE_READY 0x07
+#define TYPE_RULES_ACK 0x08
+#define TAG_RULE_COUNT 0x50
 #define TAG_RULE 0x10
 #define TAG_RTC_TS 0x20
 #define TAG_ADDON_MASK 0x40
@@ -177,11 +181,11 @@ inline void ledWrite(uint8_t pin, bool on) {
 
 // ---- GSM: state machine modem (probe/negosiasi/health-check) ----
 #define GSM_UART_BAUD 9600
-#define GSM_PROBE_INTERVAL_MS 3000          // interval cek modem saat NO_MODEM
-#define GSM_STEP_INTERVAL_MS 2000           // jeda antar percobaan step negosiasi
-#define GSM_MAX_STEP_FAILS 5                // gagal berturut2 saat negosiasi -> anggap modem lepas
+#define GSM_PROBE_INTERVAL_MS 3000  // interval cek modem saat NO_MODEM
+#define GSM_STEP_INTERVAL_MS 2000
+#define GSM_MAX_STEP_FAILS 5
 #define GSM_HEALTH_CHECK_INTERVAL_MS 15000  // interval health-check saat READY
-#define GSM_MAX_HEALTH_FAILS 3              // gagal health-check berturut2 -> anggap modem lepas
+#define GSM_MAX_HEALTH_FAILS 3              // gagal health-check
 
 // ---- GSM: AT command engine (gsmSendAT/gsmWaitFor) ----
 #define GSM_AT_RESP_MAX 256
@@ -198,7 +202,7 @@ inline void ledWrite(uint8_t pin, bool on) {
 #define GSM_HTTP_PARA_TIMEOUT_MS 2000
 #define GSM_HTTP_DATA_PROMPT_TIMEOUT_MS 3000
 #define GSM_HTTP_DATA_CONFIRM_TIMEOUT_MS 5000
-#define GSM_HTTP_ACTION_TIMEOUT_MS 15000  // POST bisa lama, tergantung jaringan
+#define GSM_HTTP_ACTION_TIMEOUT_MS 15000
 #define GSM_HTTP_READ_TIMEOUT_MS 5000
 
 // ---- GSM: transport MQTT (AT+CMQTTSTART/ACCQ/CONNECT/PUB/SUB/DISC/STOP) ----
@@ -211,18 +215,28 @@ inline void ledWrite(uint8_t pin, bool on) {
 #define GSM_MQTT_TOPIC_PROMPT_TIMEOUT_MS 2000
 #define GSM_MQTT_PAYLOAD_PROMPT_TIMEOUT_MS 2000
 
-// ================== LED STATUS (Manual Book ref. hal. 13-14) ==================
-#define LED_RUN_BLINK_INIT_MS 500U    // periode blink lambat saat init
+// ================== LED STATUS ==================
+// RUN LED state machine timings (lihat RunLedState_t / updateRunLedState()):
+//  - BOOT           : blink cepat, menandakan proses inisialisasi
+//  - NETWORK_WAIT   : solid ON, boot selesai tapi network/cloud belum siap
+//  - CLOUD_READY    : blink lambat, network & cloud sudah siap
+#define LED_RUN_BLINK_BOOT_MS 100U     // periode blink cepat saat boot/init
+#define LED_RUN_BLINK_CLOUD_MS 1000U   // periode blink lambat saat cloud ready
 #define LED_ERR_BLINK_ON_MS 150U      // durasi tiap kedip ON
 #define LED_ERR_BLINK_OFF_MS 150U     // jeda antar kedip dalam 1 pattern
 #define LED_ERR_PATTERN_GAP_MS 1200U  // jeda sebelum pattern diulang
 
 // ================== STM32 COMM WATCHDOG ==================
-#define STM_DATA_PERIOD_MS           60000UL
-#define STM_COMM_MISSED_CYCLES_ALLOWED  2UL  
-#define STM_COMM_JITTER_MARGIN_MS       15000UL
-#define STM_COMM_TIMEOUT_MS ((STM_DATA_PERIOD_MS * STM_COMM_MISSED_CYCLES_ALLOWED) + STM_COMM_JITTER_MARGIN_MS)  // = 135000 ms 
-#define STM_COMM_CONFIRM_MS           3000UL
+#define STM_DATA_PERIOD_MS 60000UL
+#define STM_COMM_MISSED_CYCLES_ALLOWED 2UL
+#define STM_COMM_JITTER_MARGIN_MS 15000UL
+#define STM_COMM_TIMEOUT_MS ((STM_DATA_PERIOD_MS * STM_COMM_MISSED_CYCLES_ALLOWED) + STM_COMM_JITTER_MARGIN_MS)  // = 135000 ms
+#define STM_COMM_CONFIRM_MS 3000UL
+
+// ================== RULES SYNC STATE MACHINE ==================
+#define RULES_STM_READY_FALLBACK_MS 3000U
+#define RULES_ACK_TIMEOUT_MS 2000U   // tunggu ACK sebelum retry
+#define RULES_SYNC_MAX_LOG_RETRY 5U  // hanya utk kurangi spam log
 
 // ================== GLOBAL ==================
 BLECharacteristic* bleTxChar = nullptr;
@@ -243,6 +257,19 @@ unsigned long lastNetCheck = 0;
 bool longActionDone = false;
 bool wsConnected = false;
 volatile bool needRestart = false;
+
+// ================== RULES SYNC STATE MACHINE ==================
+enum RulesSyncState_t { RS_WAIT_STM_READY,
+                        RS_SENDING,
+                        RS_WAIT_ACK,
+                        RS_CONFIRMED };
+volatile RulesSyncState_t rulesSyncState = RS_WAIT_STM_READY;
+uint32_t rulesSyncStateEnteredAt = 0;
+uint16_t rulesSyncRetryCount = 0;
+uint8_t rulesSyncLastSentCount = 0;
+volatile bool stmReadyReceived = false;
+volatile bool rulesAckReceived = false;
+volatile uint8_t rulesAckCount = 0;
 volatile bool wsAckOk = false;
 volatile uint32_t wsAckSeq = 0;
 bool errRTC = false;
@@ -275,20 +302,35 @@ BleRxTransfer bleRx;
 
 // ================== SYSTEM / LED STATUS ==================
 bool sysReady = false;
-bool errCommTimeout = false;  // true = LED harus tampilkan pola error comm (hasil akhir StmComm_Update())
+bool errCommTimeout = false;
 bool errCommTLV = false;
 bool errComm = false;
 bool errNet = false;
 bool fatalErr = false;
-unsigned long lastStmFrameMs = 0;   // timestamp frame TERAKHIR yg valid (SOF+CRC OK) dari STM32
+unsigned long lastStmFrameMs = 0;
 static uint8_t ledErrBlinksTarget = 0;
 
-// ---- STM32 comm watchdog: state machine kecil, modular, terpisah dari
-// LED rendering. Lihat StmComm_Update()/StmComm_NotifyValidFrame(). ----
+// ---- RUN LED State Machine ----
+// Satu-satunya sumber kebenaran status operasional utk RUN LED.
+// Modul lain (WiFi/Ethernet/MQTT/WS/GSM/dll) TIDAK menulis GPIO LED_RUN
+// secara langsung - mereka hanya mengubah sysReady/netState/wsConnected/
+// mqttClient/gsmState, lalu updateRunLedState() yang membaca semua itu
+// dan menentukan state; renderRunLed() satu-satunya fungsi yg menulis GPIO.
+// Pengecualian: saat BLE aktif (BLE_STARTING/BLE_RUNNING), updateStatusLeds()
+// meng-override LED_RUN & LED_ERR jadi solid ON, melewati state machine ini.
+enum RunLedState_t {
+  RUN_LED_BOOT,          // fast blink: init/boot & sedang mencoba connect ke network
+  RUN_LED_NETWORK_WAIT,  // solid ON: setup network selesai tapi TIDAK dapat IP (wifi/eth gagal)
+  RUN_LED_CLOUD_READY,   // slow blink: sudah dapat IP (wifi/ethernet)
+  RUN_LED_OFF            // off: fatal error (STM ERROR LED yang menyala)
+};
+static RunLedState_t runLedState = RUN_LED_BOOT;
+
+// ---- STM32 comm watchdog----
 enum StmCommState {
-  STM_COMM_OK = 0,      // frame valid masih diterima dlm batas STM_COMM_TIMEOUT_MS
-  STM_COMM_SUSPECT,     // ambang timeout terlampaui, menunggu konfirmasi STM_COMM_CONFIRM_MS
-  STM_COMM_LOST         // sudah terkonfirmasi hilang -> errCommTimeout = true
+  STM_COMM_OK = 0,
+  STM_COMM_SUSPECT,
+  STM_COMM_LOST
 };
 static StmCommState stmCommState = STM_COMM_OK;
 static unsigned long stmCommSuspectSinceMs = 0;
@@ -308,16 +350,16 @@ HardwareSerial SerialGSM(1);
 GsmState gsmState = GSM_NO_MODEM;
 unsigned long gsmLastProbe = 0;
 unsigned long gsmLastStateChange = 0;
-uint8_t gsmFailCount = 0;        // gagal berturut2 di state negosiasi saat ini
-uint8_t gsmHealthFailCount = 0;  // gagal berturut2 health-check saat READY
-bool gsmMqttStarted = false;     // AT+CMQTTSTART sudah dijalankan (service aktif)
-bool gsmMqttConnected = false;   // client sudah ACCQ+CONNECT+SUB ke broker
+uint8_t gsmFailCount = 0;
+uint8_t gsmHealthFailCount = 0;
+bool gsmMqttStarted = false;
+bool gsmMqttConnected = false;
 
 // ================== ADDON: EKSPANSI INPUT (PCF8574) ==================
-uint8_t addonInputMask = 0;      // nilai stabil (sudah lolos debounce), ini yg dikirim ke STM32
-uint8_t addonRawMaskLast = 0;    // raw hasil poll I2C terakhir, dipakai buat deteksi perubahan
+uint8_t addonInputMask = 0;
+uint8_t addonRawMaskLast = 0;
 unsigned long addonLastPoll = 0;
-unsigned long addonLastChangeMs = 0;  // kapan terakhir raw mask berubah
+unsigned long addonLastChangeMs = 0;
 bool addonMaskSentOnce = false;
 
 // ================== TIMERS ==================
@@ -357,6 +399,15 @@ struct WifiConfig {
   String password;
 };
 
+struct EthernetConfig {
+  bool dhcp;
+  String ip;
+  String subnet;
+  String gateway;
+  String dns1;
+  String dns2;
+};
+
 struct GsmConfig {
   String apn;
 };
@@ -375,6 +426,7 @@ struct AppConfig {
   NetworkConfig network;
   TransportConfig transport;
   WifiConfig wifi;
+  EthernetConfig ethernet;
   GsmConfig gsm;
   RulesConfig rules;
   AddonConfig addon;
@@ -393,11 +445,8 @@ const char* moduleToStr(uint8_t mid) {
   }
 }
 
-// ================== STM32 COMM WATCHDOG (modular) ==================
-// Dipanggil sekali setiap kali processFrame() berhasil memvalidasi sebuah
-// frame dari STM32 (SOF cocok DAN CRC16 cocok - lihat processFrame()).
-// Byte UART mentah/frame rusak TIDAK memanggil ini, jadi timeout hanya
-// dihitung dari paket yang benar2 valid, bukan sekadar aktivitas UART.
+// ================== STM32 COMM WATCHDOG==================
+
 void StmComm_NotifyValidFrame() {
   lastStmFrameMs = millis();
 
@@ -409,16 +458,11 @@ void StmComm_NotifyValidFrame() {
   errCommTimeout = false;
 }
 
-// Dipanggil tiap iterasi loop() dari updateLedErrorFlags(). Pure time-check,
-// tidak menyentuh UART - jadi murni "last valid packet timestamp" + state
-// machine kecil dgn 1 langkah debounce (SUSPECT) sebelum LOST final.
 void StmComm_Update() {
-  // Belum pernah terima 1 pun frame valid sejak boot -> jangan dianggap
-  // timeout (biarkan proses awal komunikasi berjalan dulu).
+
   if (lastStmFrameMs == 0) return;
 
-  unsigned long silenceMs = millis() - lastStmFrameMs;  // aman thd rollover millis()
-
+  unsigned long silenceMs = millis() - lastStmFrameMs;
   switch (stmCommState) {
     case STM_COMM_OK:
       if (silenceMs > STM_COMM_TIMEOUT_MS) {
@@ -430,8 +474,6 @@ void StmComm_Update() {
 
     case STM_COMM_SUSPECT:
       if (silenceMs <= STM_COMM_TIMEOUT_MS) {
-        // Fallback jaga2 (normalnya StmComm_NotifyValidFrame() sudah
-        // langsung mengembalikan ke OK begitu frame valid diterima).
         stmCommState = STM_COMM_OK;
         stmCommSuspectSinceMs = 0;
         break;
@@ -445,8 +487,6 @@ void StmComm_Update() {
       break;
 
     case STM_COMM_LOST:
-      // Tetap LOST sampai ada frame valid baru masuk (lihat
-      // StmComm_NotifyValidFrame()). errCommTimeout tetap true di sini.
       break;
   }
 }
@@ -468,23 +508,147 @@ void updateLedErrorFlags() {
   }
 }
 
+// Menentukan apakah "Cloud" sudah siap dipakai, sesuai transport aktif.
+// - mqtt / ws  : punya koneksi persistent -> cek status koneksi transport itu.
+// - gsm        : gunakan state machine modem (GSM_READY = siap kirim).
+// - tcp/httppost: transport ini connect per-pengiriman (tidak persistent,
+//   lihat sendByTransport()/CATATAN ARSITEKTUR di atasnya), sehingga tidak
+//   ada status koneksi persistent yang bisa dipantau tanpa mengubah arsitektur
+//   transport tersebut. Untuk transport ini, "cloud ready" disederhanakan
+//   menjadi "network layer sudah UP" (netState == NET_UP).
+bool isCloudReady() {
+  if (netState != NET_UP) return false;
+
+  if (isMode("gsm")) {
+    return gsmState == GSM_READY;
+  }
+
+  if (strcasecmp(config.transport.type.c_str(), "mqtt") == 0) {
+    return mqttClient.connected();
+  }
+  if (strcasecmp(config.transport.type.c_str(), "ws") == 0) {
+    return wsConnected;
+  }
+
+  // tcp / httppost (dan default lainnya)
+  return true;
+}
+
+// Satu-satunya fungsi yang MENENTUKAN state RUN LED.
+// Dipanggil tiap loop() dari updateStatusLeds(); membaca sysReady, netState,
+// dan status transport (via isCloudReady()) - tidak ada modul lain yang boleh
+// mengubah runLedState secara langsung.
+void updateRunLedState() {
+  if (fatalErr) {
+    runLedState = RUN_LED_OFF;
+  } else if (!sysReady) {
+    runLedState = RUN_LED_BOOT;
+  } else if (netState == NET_UP) {
+    // Sudah dapat IP (wifi/ethernet) -> blink lambat, terlepas dari status
+    // cloud/transport (mqtt/ws/gsm). isCloudReady() sengaja tidak dipakai
+    // di sini sesuai spesifikasi: LED_RUN hanya merefleksikan status IP.
+    runLedState = RUN_LED_CLOUD_READY;
+  } else {
+    // Belum dapat IP sama sekali (wifi maupun ethernet gagal) -> solid ON
+    runLedState = RUN_LED_NETWORK_WAIT;
+  }
+}
+
+// Satu-satunya fungsi yang MENULIS GPIO LED_RUN, berdasarkan runLedState.
+// Non-blocking (pakai millis()), tidak mengganggu runtime/komunikasi MCU.
+void renderRunLed() {
+  unsigned long now = millis();
+  static unsigned long lastToggle = 0;
+  static bool ledOn = false;
+  static RunLedState_t lastRenderedState = RUN_LED_OFF;
+  static bool firstRun = true;
+
+  if (firstRun || runLedState != lastRenderedState) {
+    firstRun = false;
+    lastRenderedState = runLedState;
+    lastToggle = now;
+    ledOn = true;  // blink states selalu mulai dari ON saat masuk state baru
+  }
+
+  switch (runLedState) {
+    case RUN_LED_OFF:
+      ledWrite(LED_RUN, false);
+      break;
+
+    case RUN_LED_NETWORK_WAIT:
+      ledWrite(LED_RUN, true);
+      break;
+
+    case RUN_LED_BOOT:
+      if (now - lastToggle >= LED_RUN_BLINK_BOOT_MS) {
+        lastToggle = now;
+        ledOn = !ledOn;
+      }
+      ledWrite(LED_RUN, ledOn);
+      break;
+
+    case RUN_LED_CLOUD_READY:
+      if (now - lastToggle >= LED_RUN_BLINK_CLOUD_MS) {
+        lastToggle = now;
+        ledOn = !ledOn;
+      }
+      ledWrite(LED_RUN, ledOn);
+      break;
+  }
+}
+
+// ---- BOOT BLINK (hardware timer) ----
+// setup()/initNetwork() sepenuhnya blocking (banyak delay() & operasi WiFi/
+// Ethernet yang bisa makan waktu detik-an) sehingga renderRunLed() yang
+// biasanya dipanggil dari loop() TIDAK sempat jalan cukup sering utk blink
+// cepat yang terlihat mulus. Solusinya: pakai esp_timer periodik independen
+// yang toggle GPIO LED_RUN sendiri, dari === BOOT === sampai === SETUP DONE ===,
+// tidak peduli apapun yang sedang blocking di loop utama.
+static esp_timer_handle_t bootBlinkTimer = nullptr;
+
+static void bootBlinkTimerCb(void* arg) {
+  static bool ledOn = false;
+  ledOn = !ledOn;
+  ledWrite(LED_RUN, ledOn);
+}
+
+void startBootBlink() {
+  if (bootBlinkTimer != nullptr) return;
+  const esp_timer_create_args_t timerArgs = {
+    .callback = &bootBlinkTimerCb,
+    .arg = nullptr,
+    .dispatch_method = ESP_TIMER_TASK,
+    .name = "boot_blink"
+  };
+  esp_timer_create(&timerArgs, &bootBlinkTimer);
+  esp_timer_start_periodic(bootBlinkTimer, (uint64_t)LED_RUN_BLINK_BOOT_MS * 1000ULL);
+}
+
+void stopBootBlink() {
+  if (bootBlinkTimer == nullptr) return;
+  esp_timer_stop(bootBlinkTimer);
+  esp_timer_delete(bootBlinkTimer);
+  bootBlinkTimer = nullptr;
+}
+
 void updateStatusLeds() {
   unsigned long now = millis();
 
-  // ---------- LED RUN ----------
-  if (fatalErr) {
-    ledWrite(LED_RUN, false);
-  } else if (!sysReady) {
-    static unsigned long lastToggle = 0;
-    static bool ledState = false;
-    if (now - lastToggle >= LED_RUN_BLINK_INIT_MS) {
-      lastToggle = now;
-      ledState = !ledState;
-      ledWrite(LED_RUN, ledState);
-    }
-  } else {
+  // ---------- BLE ACTIVE OVERRIDE ----------
+  // Selama BLE menyala (long press tombol -> startBLE()), LED_RUN & LED_ERR
+  // dipaksa solid ON sebagai indikator mode BLE, mengabaikan status
+  // boot/network/error normal. Ini harus dipanggil tiap loop() (bukan hanya
+  // sekali di startBLE()) karena updateStatusLeds() jalan tiap iterasi loop
+  // dan akan menimpa nilai GPIO jika tidak di-override di sini.
+  if (bleState == BLE_STARTING || bleState == BLE_RUNNING) {
     ledWrite(LED_RUN, true);
+    ledWrite(LED_ERR, true);
+    return;
   }
+
+  // ---------- LED RUN ----------
+  updateRunLedState();
+  renderRunLed();
 
   // ---------- LED ERROR ----------
   if (fatalErr) {
@@ -793,7 +957,7 @@ class BleRxCallbacks : public BLECharacteristicCallbacks {
     Serial.print("[BLE RX] ");
     Serial.println(raw);
 
-    // ---- Framed protocol (S/H/D/E) untuk payload panjang, mirror dari BLE-TX ----
+    // ---- Framed protocol (S/H/D/E) untuk payload panjang ----
     if (raw == "S") {
       bleRxReset();
       bleRx.state = BLE_RX_HEADER;
@@ -874,7 +1038,6 @@ class BleRxCallbacks : public BLECharacteristicCallbacks {
       return;
     }
 
-    // ---- Legacy: command pendek tanpa framing (muat dalam 1 paket BLE) ----
     handleBleCommand(raw);
   }
 };
@@ -1003,6 +1166,20 @@ bool loadConfig() {
   config.wifi.ssid.trim();
   config.wifi.password.trim();
 
+  // ---------------- ETHERNET ----------------
+  config.ethernet.dhcp =
+    doc["ethernet"]["dhcp"] | true;
+  config.ethernet.ip =
+    doc["ethernet"]["ip"] | "";
+  config.ethernet.subnet =
+    doc["ethernet"]["subnet"] | "";
+  config.ethernet.gateway =
+    doc["ethernet"]["gateway"] | "";
+  config.ethernet.dns1 =
+    doc["ethernet"]["dns1"] | "";
+  config.ethernet.dns2 =
+    doc["ethernet"]["dns2"] | "";
+
   // ---------------- GSM (opsional, add-on) ----------------
   config.gsm.apn =
     doc["gsm"]["apn"] | "";
@@ -1059,6 +1236,9 @@ bool loadConfig() {
 bool startEthernet(uint32_t timeoutMs = ETH_LINK_TIMEOUT_MS) {
   Ethernet.init(PIN_CS_W5500);
 
+  auto hw = Ethernet.hardwareStatus();
+  LOGF("[NET] hardwareStatus = %d\n", (int)hw);
+
   // ---------- CEK LINK ----------
   LOGI("[NET] checking Ethernet link...");
   unsigned long start = millis();
@@ -1071,31 +1251,53 @@ bool startEthernet(uint32_t timeoutMs = ETH_LINK_TIMEOUT_MS) {
     if (link == LinkOFF) {
       LOGI("[NET] Ethernet link DOWN, waiting...");
     }
-    updateStatusLeds();
     delay(500);
   }
-  if (Ethernet.linkStatus() != LinkON) {
-    LOGI("[NET] Ethernet cable not detected");
-    return false;
-  }
 
-  // ---------- DHCP ----------
-  LOGI("[NET] requesting DHCP...");
-  getEspBaseMac(mac);
-  LOGF("[NET] MAC = %02X:%02X:%02X:%02X:%02X:%02X\n",
-       mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  start = millis();
-  while (millis() - start < timeoutMs) {
-    if (Ethernet.begin(mac) != 0) {
-      LOG("[NET] Ethernet IP: ");
-      Serial.println(Ethernet.localIP());
-      return true;
+  // if (Ethernet.linkStatus() != LinkON) {
+  //   LOGI("[NET] Ethernet cable not detected");
+  //   return false;
+  // }
+
+  if (config.ethernet.dhcp) {
+    // ---------- DHCP ----------
+    LOGI("[NET] requesting DHCP...");
+    getEspBaseMac(mac);
+    LOGF("[NET] MAC = %02X:%02X:%02X:%02X:%02X:%02X\n",
+         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    start = millis();
+    while (millis() - start < timeoutMs) {
+      if (Ethernet.begin(mac) != 0) {
+        LOG("[NET] Ethernet IP: ");
+        Serial.println(Ethernet.localIP());
+        return true;
+      }
+      delay(ETH_DHCP_RETRY_MS);
     }
-    updateStatusLeds();
-    delay(ETH_DHCP_RETRY_MS);
+    LOGI("[NET] DHCP timeout");
+    return false;
+  } else {
+    // ---------- STATIC IP ----------
+    LOGI("[NET] applying Static IP...");
+    getEspBaseMac(mac);
+    LOGF("[NET] MAC = %02X:%02X:%02X:%02X:%02X:%02X\n",
+         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    IPAddress ip, dns1, gateway, subnet;
+    ip.fromString(config.ethernet.ip);
+    subnet.fromString(config.ethernet.subnet);
+    gateway.fromString(config.ethernet.gateway);
+    dns1.fromString(config.ethernet.dns1);
+
+    Ethernet.begin(mac, ip, dns1, gateway, subnet);
+    if (Ethernet.localIP() == IPAddress(255, 255, 255, 255) || Ethernet.localIP() == IPAddress(0, 0, 0, 0)) {
+      LOGI("[NET] Static IP assignment FAILED (hardware not responding)");
+      return false;
+    }
+    LOG("[NET] Ethernet IP (Static): ");
+    Serial.println(Ethernet.localIP());
+    return true;
   }
-  LOGI("[NET] DHCP timeout");
-  return false;
 }
 
 bool tryEthernet() {
@@ -1204,7 +1406,6 @@ bool startWiFiSTA(uint32_t timeoutMs = HEARTBEAT_MS) {
       break;
     }
 
-    updateStatusLeds();
     delay(500);
 
     LOG(".");
@@ -2141,6 +2342,46 @@ bool parseAck(const char* json, uint32_t expectSeq) {
   return false;
 }
 
+/* ============================================================================
+   CATATAN ARSITEKTUR (hasil review reliability end-to-end STM32<->ESP32<->Cloud)
+   ============================================================================
+   Fungsi sendByTransport() ini dipanggil SECARA BLOCKING dari
+   handleDataFromSTM() (dipanggil dari handleUART() setiap loop()). Selama
+   fungsi ini berjalan (bisa sampai ~35-40 detik best-case utk mode GSM+HTTP:
+   HTTPINIT + PARA + prompt + confirm + HTTPACTION 15s + HTTPREAD), SELURUH
+   loop() ESP32 berhenti: UART dari STM32 tidak diproses, BLE tidak jalan,
+   watchdog comm tidak di-service.
+
+   Konsekuensi nyata: STM32 menunggu ACK balik hanya ACK_TIMEOUT_MS (lihat
+   main.c - sudah dinaikkan jadi 45000ms utk mengakomodasi transport GSM/HTTP
+   yg lambat, TAPI kalau instalasi Anda pakai transport itu dan network makin
+   lambat dari perkiraan, STM32 tetap bisa timeout & retry SEBELUM ESP32
+   selesai proses request sebelumnya -> ESP32 memproses TLV yang sama sebagai
+   pengiriman BARU ke cloud -> DUPLIKAT.
+
+   Redesign yang direkomendasikan (belum diimplementasikan di sini karena
+   perlu pengujian hardware nyata utk tiap transport - GSM AT engine, HTTP,
+   TCP, MQTT, WS - agar tidak merusak yang sudah battle-tested):
+
+   1. Non-blocking dispatcher: ganti sendByTransport() blocking ini dengan
+      state machine (mirip TX_Process() di STM32) yang jalan per-iterasi
+      loop(), supaya handleUART() tetap responsif menerima frame STM32
+      berikutnya (termasuk retry) sambil request cloud sebelumnya masih
+      berjalan di background.
+   2. Outbox persisten di ESP32 (LittleFS): simpan {seq, json, status:
+      "sending"/"acked"} SEBELUM memanggil transport, supaya kalau ESP32
+      restart di tengah proses (brownout - lihat logResetReason(), ESP32
+      disebut rawan brownout reset saat GSM aktif), status "sedang
+      mengirim seq X" tidak hilang - saat boot ESP32 bisa cek status
+      terakhir sebelum memutuskan mengirim ulang atau tidak.
+   3. WAJIB, terlepas dari 2 poin di atas: Cloud HARUS idempotent
+      berdasarkan (device_id, seq) - tolak/abaikan seq yang sudah pernah
+      diterima. Ini satu-satunya cara menutup celah duplikat SECARA
+      TUNTAS, karena "exactly-once delivery" di jaringan yang tidak
+      reliable pada dasarnya mustahil dijamin hanya dari sisi pengirim;
+      yang bisa dicapai realistis adalah at-least-once + idempotent
+      receiver = effectively-once.
+   ============================================================================ */
 bool sendByTransport(uint32_t seq, const char* jsonLine) {
 
   if (isMode("gsm")) {
@@ -2208,6 +2449,24 @@ void processFrame(uint8_t* buf, uint16_t len) {
     LOGI("[UART] ACK from STM");
   } else if (type == 0x05) {  // ERR
     handleErrorFromSTM(payload, payloadLen);
+  } else if (type == TYPE_READY) {
+    LOGI("[SYNC] READY diterima dari STM32");
+    stmReadyReceived = true;
+  } else if (type == TYPE_RULES_ACK) {
+    uint8_t count = 0;
+    size_t i = 0;
+    while (i + 2 <= payloadLen) {
+      uint8_t tag = payload[i];
+      uint8_t l = payload[i + 1];
+      if (i + 2 + l > payloadLen) break;
+      if (tag == TAG_RULE_COUNT && l == 1) {
+        count = payload[i + 2];
+      }
+      i += 2 + l;
+    }
+    LOGF("[SYNC] RULES_ACK diterima dari STM32, count=%d\n", count);
+    rulesAckCount = count;
+    rulesAckReceived = true;
   }
 }
 
@@ -2242,7 +2501,7 @@ void handleDataFromSTM(uint8_t* tlv, size_t len) {
       case 0x03:  // HUM
         if (l == 2) hum = (int16_t)rd16(&tlv[i]);
         break;
-      case 0x04:  // DIG_IN 
+      case 0x04:  // DIG_IN
         if (l == 4) digMask = rd32(&tlv[i]);
         break;
       case 0x05:  // AN_IN (4 channel)
@@ -2431,6 +2690,66 @@ void sendRulesToSTM32() {
   LOGI("[RULE] TLV rules sent to STM");
 }
 
+/* rulesSyncTask() - dipanggil tiap loop(), non-blocking.
+ * Menggantikan pemanggilan langsung sendRulesToSTM32() dari initFS().
+ * Lihat komentar di deklarasi RulesSyncState_t utk penjelasan alur. */
+void rulesSyncTask() {
+  uint32_t now = millis();
+
+  switch (rulesSyncState) {
+    case RS_WAIT_STM_READY:
+      if (stmReadyReceived) {
+        LOGI("[SYNC] STM32 READY diterima, lanjut kirim Rules");
+        rulesSyncState = RS_SENDING;
+      } else if (now - rulesSyncStateEnteredAt > RULES_STM_READY_FALLBACK_MS) {
+        // READY tak kunjung datang - kemungkinan besar STM32 sudah lama
+        // hidup sebelum ESP32 ini boot/restart (mis. lewat tombol Save
+        // Config, STM32 tidak mengulang kirim READY). Tetap coba kirim;
+        // kalaupun STM32 ternyata belum siap, mekanisme retry-by-ACK di
+        // bawah akan menutupinya.
+        LOGW("[SYNC] Timeout menunggu READY dari STM32, coba kirim Rules tanpa handshake");
+        rulesSyncState = RS_SENDING;
+      }
+      break;
+
+    case RS_SENDING:
+      rulesSyncLastSentCount = config.rules.count;
+      sendRulesToSTM32();
+      rulesAckReceived = false;
+      rulesSyncStateEnteredAt = now;
+      rulesSyncState = RS_WAIT_ACK;
+      break;
+
+    case RS_WAIT_ACK:
+      if (rulesAckReceived) {
+        if (rulesAckCount == rulesSyncLastSentCount) {
+          LOGF("[SYNC] Rules terkonfirmasi diterapkan STM32, count=%d\n", rulesAckCount);
+          rulesSyncState = RS_CONFIRMED;
+        } else {
+          LOGF("[SYNC] Jumlah rule tidak cocok (kirim=%d, ack=%d), retry\n",
+               rulesSyncLastSentCount, rulesAckCount);
+          rulesSyncRetryCount++;
+          rulesSyncState = RS_SENDING;
+        }
+      } else if (now - rulesSyncStateEnteredAt > RULES_ACK_TIMEOUT_MS) {
+        rulesSyncRetryCount++;
+        if (rulesSyncRetryCount <= RULES_SYNC_MAX_LOG_RETRY) {
+          LOGF("[SYNC] ACK timeout, retry ke-%d\n", rulesSyncRetryCount);
+        }
+        // Retry TANPA BATAS - target: selalu tersinkron otomatis tanpa
+        // perlu buka BLE/tekan Save Config manual. Interval retry sudah
+        // dibatasi RULES_ACK_TIMEOUT_MS (2s), cukup jarang utk tidak
+        // membanjiri UART tapi cukup sering utk cepat pulih.
+        rulesSyncState = RS_SENDING;
+      }
+      break;
+
+    case RS_CONFIRMED:
+    default:
+      break;
+  }
+}
+
 uint32_t parseDateTimeToEpoch(const String& dt) {
 
   struct tm t {};
@@ -2578,9 +2897,9 @@ void epochToISO8601(uint32_t epoch, char* out, size_t outLen) {
 void buildDigArray(uint32_t digMask, char* out, size_t len) {
   size_t pos = 0;
   pos += snprintf(out + pos, len - pos, "[");
-  
+
   int totalInputs = isAddon("ekspansi_input") ? 19 : 11;
-  
+
   for (int i = 0; i < totalInputs; i++) {
     int bit = (digMask >> i) & 1;
     pos += snprintf(out + pos, len - pos,
@@ -2807,6 +3126,8 @@ void initGPIO() {
   ledWrite(LED_RUN, false);
   ledWrite(LED_ERR, false);
 
+  startBootBlink();
+
   pinMode(BTN_PIN, INPUT_PULLUP);
   pinMode(PIN_CS_W5500, OUTPUT);
   digitalWrite(PIN_CS_W5500, HIGH);
@@ -2829,8 +3150,17 @@ void initFS() {
     if (!loadConfig()) {
       LOGW("[CFG] load failed, use default");
     } else {
-      delay(500);
-      sendRulesToSTM32();
+      // Rules TIDAK dikirim langsung di sini lagi (sebelumnya: delay(500)
+      // lalu sendRulesToSTM32() sekali, fire-and-forget, tanpa ACK/retry -
+      // inilah akar penyebab race saat STM32+ESP32 boot bersamaan).
+      // Sekarang cukup aktifkan state machine; pengiriman sesungguhnya
+      // menunggu handshake TYPE_READY dari STM32 (atau fallback timeout),
+      // lalu retry otomatis sampai ACK jumlah rule-nya cocok.
+      // Lihat rulesSyncTask(), dipanggil tiap loop().
+      rulesSyncState = RS_WAIT_STM_READY;
+      rulesSyncStateEnteredAt = millis();
+      stmReadyReceived = false;
+      LOGI("[SYNC] Rules sync state machine diaktifkan, menunggu STM32 READY");
     }
   }
 }
@@ -2898,6 +3228,7 @@ void initNetwork() {
 
   LOGI("=== SETUP DONE ===");
 
+  stopBootBlink();
   sysReady = true;
 }
 
@@ -3116,6 +3447,7 @@ void loop() {
   handleGSM();
   handleAddonExpansion();
   handleUART();
+  rulesSyncTask();
   handleBLE();
   updateLedErrorFlags();
   updateStatusLeds();
